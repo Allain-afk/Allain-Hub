@@ -14,7 +14,7 @@ Keyless automation scripts for Roblox. One loadstring works for every supported 
 Paste this into your executor and run it while in a supported game:
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Allain-afk/allain-automation/main/wasd"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Allain-afk/Allain-Hub/main/loader.lua"))()
 ```
 
 Press **RightShift** to show or hide the menu (you can change this in the **Config** tab).
