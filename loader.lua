@@ -37,6 +37,13 @@ local GAMES = {
 		placeIds = { 124216119978534 },
 		nameMatches = { "ride a pet" },
 	},
+	{
+		name = "Bloxstrike",
+		file = "games-obfuscated/bloxstrike.obfuscated.lua",
+		gameIds = { 114234929420007 },
+		placeIds = { 114234929420007 },
+		nameMatches = { "bloxstrike", "blox strike" },
+	},
 }
 
 if not game:IsLoaded() then
