@@ -73,7 +73,7 @@ local Window = Library:CreateWindow({
 	Title = "Allain Automation",
 	Footer = "Midnight Racing: Tokyo",
 	FooterLeft = "MR:T Automation",
-	FooterRight = "v0.3",
+	FooterRight = "v0.5",
 	Username = true,
 	Badge = "Beta",
 	NotifySide = "Right",
@@ -127,6 +127,15 @@ local LoadedRoutePoints = {}
 local LoadedRouteName = ""
 local RouteCursor = 1
 
+-- Whole-Map Road Graph state
+local MapRoadNodes = {}      -- { { pos = Vector3, neighbors = { idx, ... } }, ... }
+local MapRoadGrid = {}       -- [cellKey] = { nodeIdx, ... }
+local MapRoadBuilt = false
+local MapRoadBuilding = false
+local RecentRoadNodes = {}   -- ring buffer of recently passed node indices
+local RecentRoadSet = {}
+local LastRoadNodeIdx = nil
+
 -- ESP state
 local EventEspObjects = {}
 local CarEspObjects = {}
@@ -135,6 +144,8 @@ local CarEspObjects = {}
 local SessionStartTime = os.clock()
 local StartYen = nil
 local LastYen = 0
+local LastYenTickTime = os.clock()
+local LastYenTickAmount = 0
 local LastWebhookReportTime = 0
 
 -- FPS Boost / Low Power state
@@ -768,6 +779,379 @@ local function findNearestRouteIndex(pos, points)
 end
 
 --============================================================================--
+--// Whole-Map Road Graph Builder & Road-Path Follower
+--============================================================================--
+local ROAD_CELL_SIZE = 55
+local ROAD_NAME_KEYWORDS = {
+	"road", "asphalt", "highway", "street", "lane", "bridge", "ramp",
+	"touge", "expressway", "track", "tarmac", "freeway", "wangan", "tunnel",
+	"interchange", "driveway", "overpass", "boulevard",
+}
+
+local function roadCellKey(x, z)
+	return string.format("%d,%d", math.floor(x / ROAD_CELL_SIZE), math.floor(z / ROAD_CELL_SIZE))
+end
+
+local function nameLooksLikeRoad(str)
+	if type(str) ~= "string" then return false end
+	local l = str:lower()
+	for _, kw in ipairs(ROAD_NAME_KEYWORDS) do
+		if l:find(kw, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function isRoadPart(part, vf)
+	if not part:IsA("BasePart") or not part.CanCollide then
+		return false
+	end
+	if vf and part:IsDescendantOf(vf) then
+		return false
+	end
+	if DebugFolder and part:IsDescendantOf(DebugFolder) then
+		return false
+	end
+	-- Must be a reasonably flat, drivable surface (not a wall/building/railing)
+	if part.CFrame.UpVector.Y < 0.72 then
+		return false
+	end
+	local sx, sy, sz = part.Size.X, part.Size.Y, part.Size.Z
+	local maxH = math.max(sx, sz)
+	local minH = math.min(sx, sz)
+	if maxH < 12 or minH < 8 then
+		return false
+	end
+
+	if nameLooksLikeRoad(part.Name) then
+		return true
+	end
+	local p = part.Parent
+	if p and nameLooksLikeRoad(p.Name) then
+		return true
+	end
+	if part.Material == Enum.Material.Asphalt then
+		return true
+	end
+	if part.Material == Enum.Material.Concrete and minH >= 14 and sy <= 6 then
+		return true
+	end
+	return false
+end
+
+local function addRoadNodeDedup(pos)
+	local cx = math.floor(pos.X / ROAD_CELL_SIZE)
+	local cz = math.floor(pos.Z / ROAD_CELL_SIZE)
+	for dx = -1, 1 do
+		for dz = -1, 1 do
+			local bucket = MapRoadGrid[string.format("%d,%d", cx + dx, cz + dz)]
+			if bucket then
+				for _, idx in ipairs(bucket) do
+					local other = MapRoadNodes[idx].pos
+					local ddx = other.X - pos.X
+					local ddz = other.Z - pos.Z
+					if (ddx * ddx + ddz * ddz) < (14 * 14) and math.abs(other.Y - pos.Y) < 8 then
+						return nil
+					end
+				end
+			end
+		end
+	end
+
+	local idx = #MapRoadNodes + 1
+	MapRoadNodes[idx] = { pos = pos, neighbors = {} }
+	local key = string.format("%d,%d", cx, cz)
+	local bucket = MapRoadGrid[key]
+	if not bucket then
+		bucket = {}
+		MapRoadGrid[key] = bucket
+	end
+	table.insert(bucket, idx)
+	return idx
+end
+
+local function buildMapRoadGraph(notifyUser)
+	if MapRoadBuilding then return end
+	MapRoadBuilding = true
+	MapRoadNodes = {}
+	MapRoadGrid = {}
+	RecentRoadNodes = {}
+	RecentRoadSet = {}
+	LastRoadNodeIdx = nil
+
+	local t0 = os.clock()
+	local vf = Workspace:FindFirstChild("VehiclesFolder")
+	local partsScanned = 0
+
+	for _, desc in ipairs(Workspace:GetDescendants()) do
+		if isRoadPart(desc, vf) then
+			partsScanned = partsScanned + 1
+			local cf = desc.CFrame
+			local sx, sy, sz = desc.Size.X, desc.Size.Y, desc.Size.Z
+			local topOffset = cf.UpVector * (sy * 0.5 + 0.6)
+
+			-- Sample centerline nodes along the longer horizontal axis every ~26 studs
+			local axisVec, length
+			if sx >= sz then
+				axisVec = cf.RightVector
+				length = sx
+			else
+				axisVec = cf.LookVector
+				length = sz
+			end
+
+			local steps = math.max(1, math.floor(length / 26))
+			if steps == 1 then
+				addRoadNodeDedup(cf.Position + topOffset)
+			else
+				local startOffset = -length * 0.5 + (length / (steps * 2))
+				local stepLen = length / steps
+				for s = 0, steps - 1 do
+					local samplePos = cf.Position + axisVec * (startOffset + s * stepLen) + topOffset
+					addRoadNodeDedup(samplePos)
+				end
+			end
+		end
+	end
+
+	-- Connect each node to nearby road nodes (same elevation level, max 58 studs)
+	local edgeCount = 0
+	local maxLinkSq = 58 * 58
+	for i, node in ipairs(MapRoadNodes) do
+		local p = node.pos
+		local cx = math.floor(p.X / ROAD_CELL_SIZE)
+		local cz = math.floor(p.Z / ROAD_CELL_SIZE)
+		local cands = {}
+		for dx = -1, 1 do
+			for dz = -1, 1 do
+				local bucket = MapRoadGrid[string.format("%d,%d", cx + dx, cz + dz)]
+				if bucket then
+					for _, j in ipairs(bucket) do
+						if j ~= i then
+							local q = MapRoadNodes[j].pos
+							local ddx = q.X - p.X
+							local ddz = q.Z - p.Z
+							local dSq = ddx * ddx + ddz * ddz
+							if dSq <= maxLinkSq and dSq >= 4 and math.abs(q.Y - p.Y) < 12 then
+								table.insert(cands, { idx = j, dSq = dSq })
+							end
+						end
+					end
+				end
+			end
+		end
+		table.sort(cands, function(a, b) return a.dSq < b.dSq end)
+		for k = 1, math.min(#cands, 6) do
+			table.insert(node.neighbors, cands[k].idx)
+			edgeCount = edgeCount + 1
+		end
+	end
+
+	MapRoadBuilt = true
+	MapRoadBuilding = false
+	local elapsed = os.clock() - t0
+	local msg = string.format("Road Graph: %d nodes (%d road parts) in %.2fs", #MapRoadNodes, partsScanned, elapsed)
+	if Library.Labels and Library.Labels.RoadGraphStatus then
+		Library.Labels.RoadGraphStatus:SetText(msg)
+	end
+	if notifyUser then
+		Library:Notify({ Title = "Map Roads Scanned", Description = msg, Time = 4 })
+	end
+end
+
+local function findNearestRoadNode(pos, preferDir)
+	if #MapRoadNodes == 0 then return nil, math.huge end
+	local cx = math.floor(pos.X / ROAD_CELL_SIZE)
+	local cz = math.floor(pos.Z / ROAD_CELL_SIZE)
+	local bestIdx = nil
+	local bestScore = math.huge
+
+	for radius = 1, 2 do
+		for dx = -radius, radius do
+			for dz = -radius, radius do
+				local bucket = MapRoadGrid[string.format("%d,%d", cx + dx, cz + dz)]
+				if bucket then
+					for _, idx in ipairs(bucket) do
+						local p = MapRoadNodes[idx].pos
+						if math.abs(p.Y - pos.Y) < 16 then
+							local ddx = p.X - pos.X
+							local ddz = p.Z - pos.Z
+							local dist = math.sqrt(ddx * ddx + ddz * ddz)
+							if dist < 110 then
+								local score = dist
+								-- Slightly prefer nodes ahead of the car rather than behind
+								if preferDir and dist > 4 then
+									local dot = (ddx * preferDir.X + ddz * preferDir.Z) / dist
+									if dot < -0.2 then
+										score = score + 22
+									end
+								end
+								if score < bestScore then
+									bestScore = score
+									bestIdx = idx
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		if bestIdx then break end
+	end
+	return bestIdx, bestScore
+end
+
+local function markRoadNodeVisited(idx)
+	if not idx or idx == LastRoadNodeIdx then return end
+	LastRoadNodeIdx = idx
+	if not RecentRoadSet[idx] then
+		RecentRoadSet[idx] = true
+		table.insert(RecentRoadNodes, idx)
+		if #RecentRoadNodes > 28 then
+			local oldest = table.remove(RecentRoadNodes, 1)
+			RecentRoadSet[oldest] = nil
+		end
+	end
+end
+
+-- Plans a forward path along the whole-map road graph starting from the car's position.
+-- Returns: steer [-1..1], upcomingBendRad [0..pi], pathFound (bool)
+local function computeMapRoadGuidance(kin, speed, lookaheadMult)
+	if not MapRoadBuilt and not MapRoadBuilding then
+		buildMapRoadGraph(false)
+	end
+	if #MapRoadNodes == 0 then
+		return nil, 0, false
+	end
+
+	local startIdx = findNearestRoadNode(kin.pos, kin.flatForward)
+	if not startIdx then
+		return nil, 0, false
+	end
+	markRoadNodeVisited(startIdx)
+
+	-- Walk forward along the map road graph (~12 hops = ~280-340 studs ahead!)
+	local chain = { startIdx }
+	local inChain = { [startIdx] = true }
+	local curIdx = startIdx
+	local curDir = kin.flatForward
+
+	for _ = 1, 12 do
+		local node = MapRoadNodes[curIdx]
+		local bestNext = nil
+		local bestScore = -math.huge
+
+		for _, nIdx in ipairs(node.neighbors) do
+			if not inChain[nIdx] then
+				local step = MapRoadNodes[nIdx].pos - node.pos
+				local flatStep = Vector3.new(step.X, 0, step.Z)
+				local len = flatStep.Magnitude
+				if len > 2 then
+					local dir = flatStep / len
+					local dot = curDir:Dot(dir)
+					-- Only move forward along the road (no sharp U-turns unless dead end)
+					if dot > 0.12 then
+						local score = dot * 100
+						if RecentRoadSet[nIdx] then
+							score = score - 45
+						end
+						-- Prefer nodes that continue onward (avoid dead-end stubs)
+						if #MapRoadNodes[nIdx].neighbors >= 2 then
+							score = score + 12
+						end
+						if score > bestScore then
+							bestScore = score
+							bestNext = nIdx
+						end
+					end
+				end
+			end
+		end
+
+		if not bestNext then break end
+		local step = MapRoadNodes[bestNext].pos - node.pos
+		local flatStep = Vector3.new(step.X, 0, step.Z)
+		if flatStep.Magnitude > 1 then
+			curDir = flatStep.Unit
+		end
+		table.insert(chain, bestNext)
+		inChain[bestNext] = true
+		curIdx = bestNext
+	end
+
+	if #chain < 2 then
+		return nil, 0, false
+	end
+
+	-- Optional 3D Road Path Visualizer (cyan segments along the actual road!)
+	local showDebug = Toggles.ShowSensorRays and Toggles.ShowSensorRays.Value
+	if showDebug then
+		for k = 1, 11 do
+			local segIdx = 20 + k
+			if k < #chain then
+				local pA = MapRoadNodes[chain[k]].pos + Vector3.new(0, 1.2, 0)
+				local pB = MapRoadNodes[chain[k + 1]].pos + Vector3.new(0, 1.2, 0)
+				setDebugRayPart(segIdx, pA, pB, Color3.fromRGB(0, 235, 255))
+			elseif ActiveRayVisuals[segIdx] then
+				ActiveRayVisuals[segIdx].Transparency = 1
+			end
+		end
+	end
+
+	-- Pick Pure-Pursuit aim node at speed-adaptive lookahead distance along the road chain
+	local lookaheadDist = math.clamp((28 + math.max(speed, 0) * 0.52) * (lookaheadMult or 1.0), 26, 130)
+	local walked = 0
+	local aimPos = MapRoadNodes[chain[#chain]].pos
+	for k = 1, #chain - 1 do
+		local pA = MapRoadNodes[chain[k]].pos
+		local pB = MapRoadNodes[chain[k + 1]].pos
+		local seg = (Vector3.new(pB.X, 0, pB.Z) - Vector3.new(pA.X, 0, pA.Z)).Magnitude
+		if walked + seg >= lookaheadDist then
+			local t = (lookaheadDist - walked) / math.max(seg, 0.1)
+			aimPos = pA:Lerp(pB, math.clamp(t, 0, 1))
+			break
+		end
+		walked = walked + seg
+	end
+
+	-- Compute steering angle toward the road centerline aim point
+	local toAim = Vector3.new(aimPos.X - kin.pos.X, 0, aimPos.Z - kin.pos.Z)
+	if toAim.Magnitude < 1 then
+		return 0, 0, true
+	end
+	toAim = toAim.Unit
+	local cross = kin.flatForward.X * toAim.Z - kin.flatForward.Z * toAim.X
+	local dot = math.clamp(kin.flatForward:Dot(toAim), -1, 1)
+	local angleErr = math.atan2(cross, dot)
+	local roadSteer = math.clamp(angleErr * 1.55, -1, 1)
+
+	-- Measure upcoming road bend (curvature 2-8 hops ahead) so we brake BEFORE corners!
+	local upcomingBend = 0
+	if #chain >= 4 then
+		local p0 = MapRoadNodes[chain[1]].pos
+		local p1 = MapRoadNodes[chain[2]].pos
+		local vNear = Vector3.new(p1.X - p0.X, 0, p1.Z - p0.Z)
+		if vNear.Magnitude > 1 then
+			vNear = vNear.Unit
+			for k = 3, math.min(#chain - 1, 8) do
+				local a = MapRoadNodes[chain[k]].pos
+				local b = MapRoadNodes[chain[k + 1]].pos
+				local vFar = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+				if vFar.Magnitude > 1 then
+					local bend = math.acos(math.clamp(vNear:Dot(vFar.Unit), -1, 1))
+					if bend > upcomingBend then
+						upcomingBend = bend
+					end
+				end
+			end
+		end
+	end
+
+	return roadSteer, upcomingBend, true
+end
+
+--============================================================================--
 --// Driving Controllers (Follow-The-Gap + Physics Braking + Collision Assist)
 --============================================================================--
 local function computeObstacleAvoidance(sensors)
@@ -839,7 +1223,7 @@ local function computeStoppingDistance(speed)
 end
 
 local function stepAutoDrive(veh, kin, dt)
-	local mode = Options.AutoDriveMode and Options.AutoDriveMode.Value or "Free-Roam (Sensors)"
+	local mode = Options.AutoDriveMode and Options.AutoDriveMode.Value or "Map Road Path"
 	local targetSpeed = Options.TargetSpeed and Options.TargetSpeed.Value or 90
 	local lookaheadMult = Options.LookaheadMult and Options.LookaheadMult.Value or 1.0
 	local steerSens = Options.SteerSensitivity and Options.SteerSensitivity.Value or 1.0
@@ -860,8 +1244,26 @@ local function stepAutoDrive(veh, kin, dt)
 	local avoidSteer, leftTotal, rightTotal, bestAngle = computeObstacleAvoidance(sensors)
 	local desiredSteer = avoidSteer
 	local desiredSpeed = targetSpeed
+	local usingRoadPath = false
 
-	if mode == "Saved Route Loop" and #LoadedRoutePoints >= 5 then
+	if mode == "Map Road Path" then
+		local roadSteer, upcomingBend, found = computeMapRoadGuidance(kin, kin.forwardSpeed, lookaheadMult)
+		if found and roadSteer then
+			usingRoadPath = true
+			-- Follow the actual map road; only blend short-range obstacle avoidance for cars/barriers
+			local obsWeight = 0
+			if sensors.minForwardDist < 34 or sensors.hitOtherCarAhead then
+				obsWeight = math.clamp((34 - sensors.minForwardDist) / 24, 0.25, 0.85)
+			end
+			desiredSteer = roadSteer * (1 - obsWeight) + avoidSteer * obsWeight
+
+			-- Pre-corner braking based on upcoming road curvature 2-8 nodes ahead!
+			if upcomingBend > 0.28 then
+				local bendSlow = math.clamp(1.0 - (upcomingBend / 1.65) * 0.68, 0.30, 0.88)
+				desiredSpeed = math.min(desiredSpeed, math.max(30, targetSpeed * bendSlow))
+			end
+		end
+	elseif mode == "Saved Route Loop" and #LoadedRoutePoints >= 5 then
 		local n = #LoadedRoutePoints
 		local curPt = LoadedRoutePoints[RouteCursor]
 		local curDist = (Vector3.new(curPt.x, kin.pos.Y, curPt.z) - kin.pos).Magnitude
@@ -976,13 +1378,147 @@ local function stepAutoDrive(veh, kin, dt)
 	applyDrivingInputs(throttle, brake, SmoothedSteer, dt)
 
 	if Library.Labels.DriveStatus then
+		local modeTag = mode == "Saved Route Loop" and ("Loop: " .. LoadedRouteName)
+			or (usingRoadPath and "Map Road" or "Sensors")
 		Library.Labels.DriveStatus:SetText(string.format(
 			"Status: %s | %.0f/%.0f st/s | Ahead %.0fst | Steer %.2f",
-			mode == "Saved Route Loop" and ("Loop: " .. LoadedRouteName) or "Free-Roam",
+			modeTag,
 			speed,
 			desiredSpeed,
 			fwdDist,
 			SmoothedSteer
+		))
+	end
+end
+
+local function stepMoneyFarm(veh, kin, dt)
+	local farmMode = Options.MoneyFarmMode and Options.MoneyFarmMode.Value or "Map Road Path (Safe)"
+	local farmSpeed = Options.MoneyFarmSpeed and Options.MoneyFarmSpeed.Value or 45
+	local lookaheadMult = Options.LookaheadMult and Options.LookaheadMult.Value or 1.0
+	local watchdogOn = Toggles.YenStallWatchdog and Toggles.YenStallWatchdog.Value
+
+	local sensors = scanSensors(veh, kin, lookaheadMult)
+	local now = os.clock()
+
+	-- Reverse recovery if wedged or Yen stalled
+	if now < ReverseUntil then
+		applyDrivingInputs(0, 1.0, ReverseSteerDir, dt)
+		if Library.Labels.FarmStatusLabel then
+			Library.Labels.FarmStatusLabel:SetText("Farm: reversing (recovery)")
+		end
+		return
+	end
+
+	local avoidSteer, leftTotal, rightTotal, bestAngle = computeObstacleAvoidance(sensors)
+	local speed = kin.forwardSpeed
+	local stopDist = computeStoppingDistance(speed)
+	local fwdDist = sensors.minForwardDist
+	local desiredSteer = avoidSteer
+	local desiredSpeed = farmSpeed
+
+	if farmMode == "Map Road Path (Safe)" then
+		local roadSteer, upcomingBend, found = computeMapRoadGuidance(kin, speed, lookaheadMult)
+		if found and roadSteer then
+			local obsW = (fwdDist < 30 or sensors.hitOtherCarAhead) and 0.70 or 0.0
+			desiredSteer = roadSteer * (1 - obsW) + avoidSteer * obsW
+			if upcomingBend > 0.35 then
+				desiredSpeed = math.min(desiredSpeed, math.max(28, farmSpeed * 0.72))
+			end
+		end
+	elseif farmMode == "Circle / Donut (Open Lot)" then
+		local dir = (Options.CircleDirection and Options.CircleDirection.Value == "Right") and 1 or -1
+		local circleSteer = dir * 0.58
+		-- Override with obstacle avoidance whenever any wall/car/cliff is near
+		if fwdDist < math.max(stopDist * 1.15, 34) or sensors.leftCliff or sensors.rightCliff then
+			desiredSteer = avoidSteer
+		else
+			desiredSteer = circleSteer * 0.75 + avoidSteer * 0.25
+		end
+	elseif farmMode == "Saved Route Loop" and #LoadedRoutePoints >= 5 then
+		local n = #LoadedRoutePoints
+		local curPt = LoadedRoutePoints[RouteCursor]
+		local curDist = (Vector3.new(curPt.x, kin.pos.Y, curPt.z) - kin.pos).Magnitude
+		if curDist > 160 then
+			RouteCursor = findNearestRouteIndex(kin.pos, LoadedRoutePoints)
+		end
+		local lookaheadDist = math.clamp(24 + math.max(speed, 0) * 0.5, 24, 70)
+		local targetIdx = RouteCursor
+		local walked = 0
+		for _ = 1, 35 do
+			local pA = LoadedRoutePoints[targetIdx]
+			local nextIdx = (targetIdx % n) + 1
+			local pB = LoadedRoutePoints[nextIdx]
+			walked = walked + math.sqrt((pB.x - pA.x) ^ 2 + (pB.z - pA.z) ^ 2)
+			targetIdx = nextIdx
+			if walked >= lookaheadDist then break end
+		end
+		if math.sqrt((curPt.x - kin.pos.X) ^ 2 + (curPt.z - kin.pos.Z) ^ 2) < 26 then
+			RouteCursor = (RouteCursor % n) + 1
+		end
+		local aimPt = LoadedRoutePoints[targetIdx]
+		local toAim = Vector3.new(aimPt.x - kin.pos.X, 0, aimPt.z - kin.pos.Z)
+		if toAim.Magnitude > 1 then
+			toAim = toAim.Unit
+			local angleErr = math.atan2(
+				kin.flatForward.X * toAim.Z - kin.flatForward.Z * toAim.X,
+				math.clamp(kin.flatForward:Dot(toAim), -1, 1)
+			)
+			local routeSteer = math.clamp(angleErr * 1.45, -1, 1)
+			local obsW = (fwdDist < stopDist * 1.2 or sensors.leftCliff or sensors.rightCliff) and 0.75 or 0.15
+			desiredSteer = routeSteer * (1 - obsW) + avoidSteer * obsW
+		end
+	end
+
+	SmoothedSteer = SmoothedSteer + (math.clamp(desiredSteer, -1, 1) - SmoothedSteer) * math.min(dt * 12, 1)
+
+	-- Gentle corner slowdown & braking
+	local turnRatio = math.max(math.abs(SmoothedSteer), math.abs(bestAngle) / 75)
+	if farmMode ~= "Circle / Donut (Open Lot)" and turnRatio > 0.3 then
+		desiredSpeed = math.min(desiredSpeed, math.max(28, farmSpeed * (1.0 - turnRatio * 0.45)))
+	end
+
+	local throttle, brake = 0, 0
+	if fwdDist < 15 or fwdDist < stopDist * 0.90 then
+		desiredSpeed = 0
+		brake = 1.0
+	elseif fwdDist < stopDist * 1.40 then
+		local f = (fwdDist - stopDist * 0.90) / math.max(stopDist * 0.50, 8)
+		desiredSpeed = math.min(desiredSpeed, math.max(24, farmSpeed * f))
+	end
+
+	if brake == 0 then
+		if speed < desiredSpeed - 2 then
+			throttle = math.clamp((desiredSpeed - speed) / 18, 0.32, 1.0)
+		elseif speed > desiredSpeed + 5 then
+			brake = math.clamp((speed - desiredSpeed) / 25, 0.35, 1.0)
+		end
+	end
+
+	-- Stuck or Yen-stall watchdog (if no Yen tick for 8s while farming, reverse & turn)
+	local yenStalled = watchdogOn and (now - LastYenTickTime >= 8.5)
+	local wedgedClose = (fwdDist < 14 and speed < 10)
+	local stalled = (throttle > 0.2 and math.abs(kin.totalSpeed) < 5)
+	if wedgedClose or stalled or yenStalled then
+		StuckTimer = StuckTimer + dt * ((wedgedClose or yenStalled) and 2.5 or 1.0)
+		if StuckTimer >= 1.5 then
+			StuckTimer = 0
+			LastYenTickTime = now
+			ReverseUntil = now + 1.8
+			ReverseSteerDir = (leftTotal >= rightTotal) and 1 or -1
+			return
+		end
+	else
+		StuckTimer = math.max(0, StuckTimer - dt * 2.5)
+	end
+
+	applyDrivingInputs(throttle, brake, SmoothedSteer, dt)
+
+	if Library.Labels.FarmStatusLabel then
+		Library.Labels.FarmStatusLabel:SetText(string.format(
+			"Farm: %s | %.0f st/s | Last tick +¥%s",
+			farmMode,
+			speed,
+			formatNumber(LastYenTickAmount)
 		))
 	end
 end
@@ -1459,6 +1995,9 @@ AutoDriveBox:AddToggle("AutoDriveEnabled", {
 			end
 		else
 			refreshControlKeys()
+			if Toggles.AutoFarmMoney and Toggles.AutoFarmMoney.Value then
+				Toggles.AutoFarmMoney:SetValue(false)
+			end
 			if Toggles.CruiseEnabled and Toggles.CruiseEnabled.Value then
 				Toggles.CruiseEnabled:SetValue(false)
 			end
@@ -1473,9 +2012,20 @@ AutoDriveBox:AddToggle("AutoDriveEnabled", {
 
 AutoDriveBox:AddDropdown("AutoDriveMode", {
 	Text = "Drive Mode",
-	Values = { "Free-Roam (Sensors)", "Saved Route Loop" },
-	Default = "Free-Roam (Sensors)",
-	Tooltip = "Free-Roam uses live rays; Saved Route Loop follows a recorded loop with obstacle avoidance.",
+	Values = { "Map Road Path", "Saved Route Loop", "Free-Roam (Sensors)" },
+	Default = "Map Road Path",
+	Tooltip = "Map Road Path reads the whole map's roads & follows the centerline ahead; Saved Route follows your recorded loop.",
+})
+
+AutoDriveBox:AddButton("Scan / Rebuild Map Roads", function()
+	task.spawn(function()
+		buildMapRoadGraph(true)
+	end)
+end)
+
+AutoDriveBox:AddLabel("RoadGraphStatus", {
+	Text = "Road Graph: builds automatically on start",
+	DoesWrap = true,
 })
 
 AutoDriveBox:AddSlider("TargetSpeed", {
@@ -1809,6 +2359,80 @@ end)
 --============================================================================--
 --// UI: Tab 4 — AFK & Alerts
 --============================================================================--
+local MoneyFarmBox = Tabs.AFK:AddGroupbox({
+	Side = "Left",
+	Name = "Auto-Farm Money (Yen)",
+	IconName = "banknote",
+	Description = "Farms MR:T passive driving Yen (~¥700 / 2s = ~¥1.25M/hr) safely at optimal cruise speed.",
+})
+
+MoneyFarmBox:AddToggle("AutoFarmMoney", {
+	Text = "Auto-Farm Yen",
+	Default = false,
+	Tooltip = "Drives at the optimal Yen payout speed with collision avoidance & stall recovery.",
+	Callback = function(Value)
+		if Value then
+			refreshControlKeys()
+			LastYenTickTime = os.clock()
+			if Toggles.AutoDriveEnabled and Toggles.AutoDriveEnabled.Value then
+				Toggles.AutoDriveEnabled:SetValue(false)
+			end
+			if Toggles.CruiseEnabled and Toggles.CruiseEnabled.Value then
+				Toggles.CruiseEnabled:SetValue(false)
+			end
+			if Toggles.AntiAfk and not Toggles.AntiAfk.Value then
+				Toggles.AntiAfk:SetValue(true)
+			end
+		else
+			releaseAllDrivingKeys()
+			StuckTimer = 0
+			ReverseUntil = 0
+			if Library.Labels.FarmStatusLabel then
+				Library.Labels.FarmStatusLabel:SetText("Farm: idle")
+			end
+		end
+	end,
+}):AddKeyPicker("AutoFarmMoneyKey", {
+	Default = "F",
+	Mode = "Toggle",
+	SyncToggleState = true,
+	Text = "Auto-Farm Yen",
+})
+
+MoneyFarmBox:AddDropdown("MoneyFarmMode", {
+	Text = "Farm Strategy",
+	Values = { "Map Road Path (Safe)", "Safe Cruise (Sensors)", "Circle / Donut (Open Lot)", "Saved Route Loop" },
+	Default = "Map Road Path (Safe)",
+	Tooltip = "Map Road Path follows the whole map's road graph at ~45 st/s; Circle/Donut loops in open lots.",
+})
+
+MoneyFarmBox:AddSlider("MoneyFarmSpeed", {
+	Text = "Farm Speed",
+	Default = 45,
+	Min = 28,
+	Max = 110,
+	Rounding = 0,
+	Suffix = " st/s",
+	Tooltip = "30-50 st/s already earns the full ~¥700 / 2s passive driving payout with minimal crash risk.",
+})
+
+MoneyFarmBox:AddDropdown("CircleDirection", {
+	Text = "Circle Direction",
+	Values = { "Left", "Right" },
+	Default = "Left",
+})
+
+MoneyFarmBox:AddToggle("YenStallWatchdog", {
+	Text = "Yen Stall Auto-Recovery",
+	Default = true,
+	Tooltip = "Automatically reverses & turns if Yen stops increasing for 8+ seconds.",
+})
+
+MoneyFarmBox:AddLabel("FarmStatusLabel", {
+	Text = "Farm: idle",
+	DoesWrap = true,
+})
+
 local YenBox = Tabs.AFK:AddGroupbox({
 	Side = "Left",
 	Name = "AFK Yen Farm Stats",
@@ -1987,7 +2611,7 @@ Library.ToggleKeybind = Options.MenuKeybind
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoDriveEnabled", "RecordRouteToggle", "LowPower" })
+SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoDriveEnabled", "AutoFarmMoney", "RecordRouteToggle", "LowPower" })
 ThemeManager:SetFolder("AllainHub")
 SaveManager:SetFolder("AllainHub/midnight-racing-tokyo")
 SaveManager:BuildConfigSection(Tabs.Settings)
@@ -2017,6 +2641,7 @@ trackConn(Connections, RunService.Heartbeat:Connect(function(dt)
 	if Unloaded then return end
 
 	local veh, seat = getSeatedVehicle()
+	local moneyFarm = Toggles.AutoFarmMoney and Toggles.AutoFarmMoney.Value
 	local autoDrive = Toggles.AutoDriveEnabled and Toggles.AutoDriveEnabled.Value
 	local colPrevent = Toggles.CollisionPrevent and Toggles.CollisionPrevent.Value
 	local cruise = Toggles.CruiseEnabled and Toggles.CruiseEnabled.Value
@@ -2024,7 +2649,7 @@ trackConn(Connections, RunService.Heartbeat:Connect(function(dt)
 	local autoShift = Toggles.AutoShift and Toggles.AutoShift.Value
 
 	if not veh or not seat then
-		if autoDrive or colPrevent or cruise then
+		if moneyFarm or autoDrive or colPrevent or cruise then
 			releaseAllDrivingKeys()
 		end
 		if #ActiveRayVisuals > 0 then
@@ -2054,8 +2679,10 @@ trackConn(Connections, RunService.Heartbeat:Connect(function(dt)
 		end
 	end
 
-	-- Priority: Auto-Drive > Collision Prevention > Cruise Control
-	if autoDrive then
+	-- Priority: Auto-Farm Money > Auto-Drive > Collision Prevention > Cruise Control
+	if moneyFarm then
+		stepMoneyFarm(veh, kin, dt)
+	elseif autoDrive then
 		stepAutoDrive(veh, kin, dt)
 	elseif colPrevent then
 		local intervened = stepCollisionPrevention(veh, kin, dt)
@@ -2086,6 +2713,10 @@ task.spawn(function()
 		local curYen = getYenValue()
 		if curYen then
 			if not StartYen then StartYen = curYen end
+			if LastYen > 0 and curYen > LastYen then
+				LastYenTickAmount = curYen - LastYen
+				LastYenTickTime = os.clock()
+			end
 			LastYen = curYen
 			local earned = curYen - StartYen
 			local elapsed = math.max(os.clock() - SessionStartTime, 1)
@@ -2189,6 +2820,6 @@ end)
 
 Library:Notify({
 	Title = "Allain Automation",
-	Description = "Midnight Racing: Tokyo v0.3 loaded! Press RightShift to toggle menu.",
+	Description = "Midnight Racing: Tokyo v0.5 loaded! Press RightShift to toggle menu.",
 	Time = 4,
 })
