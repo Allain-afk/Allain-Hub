@@ -51,6 +51,13 @@ local GAMES = {
 		placeIds = { 7444724537, 5025250023 },
 		nameMatches = { "midnight racing", "mr:t" },
 	},
+	{
+		name = "Midnight Chasers: Highway Racing",
+		file = "games/midnight-chasers.lua",
+		gameIds = { 4793836769 },
+		placeIds = { 13822562292 },
+		nameMatches = { "midnight chasers", "highway racing" },
+	},
 }
 
 if not game:IsLoaded() then
