@@ -38,11 +38,11 @@ local GAMES = {
 		nameMatches = { "ride a pet" },
 	},
 	{
-		name = "Midnight Racing: Tokyo",
-		file = "games/midnight-racing-tokyo.lua",
-		gameIds = { 1198533421 },
-		placeIds = { 7444724537 },
-		nameMatches = { "midnight racing" },
+		name = "Bloxstrike",
+		file = "games-obfuscated/bloxstrike.obfuscated.lua",
+		gameIds = { 114234929420007 },
+		placeIds = { 114234929420007 },
+		nameMatches = { "bloxstrike", "blox strike" },
 	},
 	{
 		name = "Midnight Racing: Tokyo",
