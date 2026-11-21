@@ -1,6 +1,8 @@
---// Allain Automation — Midnight Racing: Tokyo (Data Scanner) \\--
--- Scan-only utility to inspect game structure, vehicles, races, checkpoints,
--- remotes, UI, and live events for building Midnight Racing: Tokyo automation.
+--// Allain Automation — Midnight Racing: Tokyo \\--
+-- Keyless automation suite for Midnight Racing: Tokyo (A-Chassis 6).
+-- Features: Free-Roam Auto-Drive, Custom Route Loop Auto-Drive, Auto Collision
+-- Prevention, Cruise Control, Auto-Shift Assist, Event/Car ESP, AFK Yen Tracker,
+-- Anti-AFK, Low-Power/FPS Boost, Discord Alerts, and Built-in Data Scanner.
 -- GameId: 1198533421 | PlaceId: 7444724537
 
 local env = (getgenv and getgenv()) or shared
@@ -26,6 +28,9 @@ end)
 
 local Players = cloneref(game:GetService("Players"))
 local Workspace = cloneref(game:GetService("Workspace"))
+local RunService = cloneref(game:GetService("RunService"))
+local UserInputService = cloneref(game:GetService("UserInputService"))
+local VirtualInputManager = cloneref(game:GetService("VirtualInputManager"))
 local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
 local ReplicatedFirst = cloneref(game:GetService("ReplicatedFirst"))
 local StarterGui = cloneref(game:GetService("StarterGui"))
@@ -34,6 +39,13 @@ local StarterPlayer = cloneref(game:GetService("StarterPlayer"))
 local CollectionService = cloneref(game:GetService("CollectionService"))
 local MarketplaceService = cloneref(game:GetService("MarketplaceService"))
 local HttpService = cloneref(game:GetService("HttpService"))
+local Lighting = cloneref(game:GetService("Lighting"))
+local okVU, VirtualUser = pcall(function()
+	return cloneref(game:GetService("VirtualUser"))
+end)
+if not okVU then
+	VirtualUser = nil
+end
 
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
@@ -59,25 +71,77 @@ local Toggles = Library.Toggles
 --// Window \\--
 local Window = Library:CreateWindow({
 	Title = "Allain Automation",
-	Footer = "Midnight Racing: Tokyo · Scanner",
-	FooterLeft = "Scan Only",
-	FooterRight = "v0.1",
+	Footer = "Midnight Racing: Tokyo",
+	FooterLeft = "MR:T Automation",
+	FooterRight = "v0.2",
 	Username = true,
 	Badge = "Beta",
 	NotifySide = "Right",
-	Size = UDim2.fromOffset(600, 560),
+	Size = UDim2.fromOffset(640, 580),
 	Center = true,
 	AutoShow = true,
 })
 
 local Tabs = {
-	Scan = Window:AddTab("Scan", "radar"),
+	AutoDrive = Window:AddTab("Auto-Drive", "car"),
+	Assist = Window:AddTab("Assist", "shield"),
+	Visuals = Window:AddTab("Events & Visuals", "eye"),
+	AFK = Window:AddTab("AFK & Alerts", "clock"),
+	Scanner = Window:AddTab("Scanner", "radar"),
 	Settings = Window:AddTab("Settings", "settings"),
 }
 
---// State & Cleanup \\--
+--============================================================================--
+--// Core State & Cleanup Helpers
+--============================================================================--
 local Connections = {}
 local CaptureConnections = {}
+local Unloaded = false
+
+-- Simulated input state
+local HeldKeys = {}
+local ControlKeys = {
+	Throttle = Enum.KeyCode.W,
+	Brake = Enum.KeyCode.S,
+	SteerLeft = Enum.KeyCode.A,
+	SteerRight = Enum.KeyCode.D,
+	ShiftUp = Enum.KeyCode.E,
+	ShiftDown = Enum.KeyCode.Q,
+	ToggleTransMode = Enum.KeyCode.M,
+}
+
+-- Driving / Sensor state
+local SmoothedSteer = 0
+local StuckTimer = 0
+local ReverseUntil = 0
+local ReverseSteerDir = 1
+local LastShiftTime = 0
+local PwmPhase = 0
+local ActiveRayVisuals = {}
+local DebugFolder = nil
+
+-- Route Recorder / Loop state
+local RecordingRoute = false
+local RecordedPoints = {}
+local LoadedRoutePoints = {}
+local LoadedRouteName = ""
+local RouteCursor = 1
+
+-- ESP state
+local EventEspObjects = {}
+local CarEspObjects = {}
+
+-- AFK / Yen Tracker state
+local SessionStartTime = os.clock()
+local StartYen = nil
+local LastYen = 0
+local LastWebhookReportTime = 0
+
+-- FPS Boost / Low Power state
+local SavedLighting = nil
+local LowPowerActive = false
+
+-- Scanner state
 local IsCapturing = false
 local CaptureEvents = {}
 local CaptureStartTime = 0
@@ -85,7 +149,6 @@ local LastReportText = ""
 local LastReportName = "mrt_scan.txt"
 local OldNamecall = nil
 local RemoteHookActive = false
-local Unloaded = false
 
 local function trackConn(list, conn)
 	if conn then
@@ -103,138 +166,147 @@ local function disconnectAll(list)
 	end
 end
 
---// Helpers \\--
 local function getRequestFunc()
-	if type(request) == "function" then
-		return request
-	end
-	if type(http_request) == "function" then
-		return http_request
-	end
-	if type(syn) == "table" and type(syn.request) == "function" then
-		return syn.request
-	end
-	if type(fluxus) == "table" and type(fluxus.request) == "function" then
-		return fluxus.request
-	end
-	if type(http) == "table" and type(http.request) == "function" then
-		return http.request
-	end
+	if type(request) == "function" then return request end
+	if type(http_request) == "function" then return http_request end
+	if type(syn) == "table" and type(syn.request) == "function" then return syn.request end
+	if type(fluxus) == "table" and type(fluxus.request) == "function" then return fluxus.request end
+	if type(http) == "table" and type(http.request) == "function" then return http.request end
 	return nil
 end
 
-local function safeFullName(inst)
-	if not inst then
-		return "nil"
+local function ensureFolders()
+	if type(isfolder) ~= "function" or type(makefolder) ~= "function" then
+		return
 	end
-	local ok, path = pcall(function()
-		return inst:GetFullName()
+	pcall(function()
+		if not isfolder("AllainHub") then makefolder("AllainHub") end
+		if not isfolder("AllainHub/scans") then makefolder("AllainHub/scans") end
+		if not isfolder("AllainHub/routes") then makefolder("AllainHub/routes") end
 	end)
-	return ok and path or tostring(inst)
 end
 
-local function fmtVec3(v)
-	if typeof(v) ~= "Vector3" then
-		return tostring(v)
+--============================================================================--
+--// Control Key Resolution & Safe VirtualInputManager Driving
+--============================================================================--
+local function resolveKeyCode(str, fallback)
+	if type(str) ~= "string" or str == "" then
+		return fallback
 	end
-	return string.format("(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z)
-end
-
-local function fmtValue(v, depth)
-	depth = depth or 0
-	local t = typeof(v)
-	if t == "Vector3" then
-		return fmtVec3(v)
-	elseif t == "CFrame" then
-		return "CF" .. fmtVec3(v.Position)
-	elseif t == "Color3" then
-		return string.format("RGB(%d,%d,%d)", math.floor(v.R * 255), math.floor(v.G * 255), math.floor(v.B * 255))
-	elseif t == "Instance" then
-		return "<" .. v.ClassName .. ":" .. safeFullName(v) .. ">"
-	elseif t == "string" then
-		local clean = v:gsub("[\r\n]+", " ")
-		if #clean > 120 then
-			clean = clean:sub(1, 120) .. "..."
-		end
-		return string.format("%q", clean)
-	elseif t == "table" then
-		if depth >= 2 then
-			return "{...}"
-		end
-		local parts = {}
-		local count = 0
-		for k, val in pairs(v) do
-			count = count + 1
-			if count > 8 then
-				table.insert(parts, "...")
-				break
-			end
-			table.insert(parts, tostring(k) .. "=" .. fmtValue(val, depth + 1))
-		end
-		return "{" .. table.concat(parts, ", ") .. "}"
-	end
-	return tostring(v)
-end
-
-local function fmtAttributes(inst)
-	local ok, attrs = pcall(function()
-		return inst:GetAttributes()
+	local ok, kc = pcall(function()
+		return Enum.KeyCode[str]
 	end)
-	if not ok or type(attrs) ~= "table" then
-		return ""
+	if ok and typeof(kc) == "EnumItem" then
+		return kc
 	end
-	local parts = {}
-	for k, v in pairs(attrs) do
-		table.insert(parts, k .. "=" .. fmtValue(v, 1))
-	end
-	if #parts == 0 then
-		return ""
-	end
-	table.sort(parts)
-	return " [attrs: " .. table.concat(parts, ", ") .. "]"
+	return fallback
 end
 
-local function getInstPosition(inst)
-	if not inst then
-		return nil
+local function refreshControlKeys()
+	local cc = LocalPlayer:FindFirstChild("CustomControls")
+	if not cc then
+		return
 	end
-	if inst:IsA("BasePart") then
-		return inst.Position
-	elseif inst:IsA("Attachment") then
-		return inst.WorldPosition
-	elseif inst:IsA("Model") then
-		local ok, cf = pcall(function()
-			return inst:GetPivot()
+	local function pick(primary, secondary, fallback)
+		local v1 = cc:FindFirstChild(primary)
+		if v1 and v1:IsA("StringValue") and v1.Value ~= "" then
+			local kc = resolveKeyCode(v1.Value, nil)
+			if kc then return kc end
+		end
+		local v2 = cc:FindFirstChild(secondary)
+		if v2 and v2:IsA("StringValue") and v2.Value ~= "" then
+			local kc = resolveKeyCode(v2.Value, nil)
+			if kc then return kc end
+		end
+		return fallback
+	end
+	ControlKeys.Throttle = pick("Throttle2", "Throttle", Enum.KeyCode.W)
+	ControlKeys.Brake = pick("Brake2", "Brake", Enum.KeyCode.S)
+	ControlKeys.SteerLeft = pick("SteerLeft2", "SteerLeft", Enum.KeyCode.A)
+	ControlKeys.SteerRight = pick("SteerRight2", "SteerRight", Enum.KeyCode.D)
+	ControlKeys.ShiftUp = pick("ShiftUp", "ShiftUp", Enum.KeyCode.E)
+	ControlKeys.ShiftDown = pick("ShiftDown", "ShiftDown", Enum.KeyCode.Q)
+	ControlKeys.ToggleTransMode = pick("ToggleTransMode", "ToggleTransMode", Enum.KeyCode.M)
+end
+refreshControlKeys()
+
+local function setKey(keyCode, down)
+	if not keyCode then return end
+	local currentlyDown = HeldKeys[keyCode] == true
+	if currentlyDown == down then
+		return
+	end
+	HeldKeys[keyCode] = down
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
+	end)
+end
+
+local function tapKey(keyCode, holdTime)
+	if not keyCode then return end
+	task.spawn(function()
+		pcall(function()
+			VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
 		end)
-		if ok and typeof(cf) == "CFrame" then
-			return cf.Position
-		end
-	end
-	local parent = inst.Parent
-	if parent then
-		if parent:IsA("BasePart") then
-			return parent.Position
-		elseif parent:IsA("Attachment") then
-			return parent.WorldPosition
-		elseif parent:IsA("Model") then
-			local ok, cf = pcall(function()
-				return parent:GetPivot()
-			end)
-			if ok and typeof(cf) == "CFrame" then
-				return cf.Position
-			end
-		end
-	end
-	return nil
+		task.wait(holdTime or 0.05)
+		pcall(function()
+			VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+		end)
+	end)
 end
 
-local function getPlayerPos()
-	local char = LocalPlayer.Character
-	if not char then
-		return nil
+local function releaseAllDrivingKeys()
+	for kc, isDown in pairs(HeldKeys) do
+		if isDown then
+			HeldKeys[kc] = false
+			pcall(function()
+				VirtualInputManager:SendKeyEvent(false, kc, false, game)
+			end)
+		end
 	end
-	local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
-	return root and root.Position or nil
+end
+
+-- Smooth PWM application: converts analog throttle [0..1], brake [0..1], steer [-1..1]
+-- into clean key holds/pulses so A-Chassis steers smoothly without harsh snapping.
+local function applyDrivingInputs(throttle, brake, steer, dt)
+	PwmPhase = (PwmPhase + dt * 10) % 1 -- 10 Hz PWM cycle
+
+	-- Throttle & Brake (mutually exclusive)
+	if brake > 0.05 then
+		setKey(ControlKeys.Throttle, false)
+		local brakeOn = brake >= 0.85 or (PwmPhase < brake)
+		setKey(ControlKeys.Brake, brakeOn)
+	elseif throttle > 0.05 then
+		setKey(ControlKeys.Brake, false)
+		local throttleOn = throttle >= 0.85 or (PwmPhase < throttle)
+		setKey(ControlKeys.Throttle, throttleOn)
+	else
+		setKey(ControlKeys.Throttle, false)
+		setKey(ControlKeys.Brake, false)
+	end
+
+	-- Steering: negative = left, positive = right
+	local absSteer = math.abs(steer)
+	if absSteer < 0.07 then
+		setKey(ControlKeys.SteerLeft, false)
+		setKey(ControlKeys.SteerRight, false)
+	elseif steer < 0 then
+		setKey(ControlKeys.SteerRight, false)
+		local leftOn = absSteer >= 0.82 or (PwmPhase < absSteer)
+		setKey(ControlKeys.SteerLeft, leftOn)
+	else
+		setKey(ControlKeys.SteerLeft, false)
+		local rightOn = absSteer >= 0.82 or (PwmPhase < absSteer)
+		setKey(ControlKeys.SteerRight, rightOn)
+	end
+end
+
+--============================================================================--
+--// Vehicle & A-Chassis Telemetry Helpers
+--============================================================================--
+local function getOwnVehicleFolder()
+	local vf = Workspace:FindFirstChild("VehiclesFolder")
+	return vf and vf:FindFirstChild(LocalPlayer.Name) or nil
 end
 
 local function getSeatedVehicle()
@@ -247,9 +319,10 @@ local function getSeatedVehicle()
 	if not seat then
 		return nil, nil
 	end
+	local ownFolder = getOwnVehicleFolder()
 	local cur = seat
 	local bestModel = nil
-	while cur and cur ~= Workspace do
+	while cur and cur ~= Workspace and cur ~= ownFolder do
 		if cur:IsA("Model") then
 			bestModel = cur
 		end
@@ -258,89 +331,908 @@ local function getSeatedVehicle()
 	return bestModel or seat.Parent, seat
 end
 
-local RACE_KEYWORDS = {
-	"race", "checkpoint", "check", "finish", "start", "lap", "track", "circuit",
-	"touge", "highway", "drift", "time", "trial", "sprint", "event", "lobby",
-	"queue", "pad", "trigger", "gate", "beacon", "marker", "waypoint", "zone",
-	"dealer", "garage", "tune", "shop", "car", "vehicle", "chassis", "spawn",
-	"delivery", "job", "mission", "quest", "money", "yen", "cash", "reward",
-}
+local function getPlayerPos()
+	local char = LocalPlayer.Character
+	if not char then return nil end
+	local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+	return root and root.Position or nil
+end
 
-local function matchesKeyword(str)
-	if type(str) ~= "string" then
+local function getVehicleKinematics(veh, seat)
+	if not veh or not seat or not seat:IsA("BasePart") then
+		return nil
+	end
+	local cf = seat.CFrame
+	local forward = cf.LookVector
+	local flatForward = Vector3.new(forward.X, 0, forward.Z)
+	if flatForward.Magnitude < 0.01 then
+		flatForward = Vector3.new(0, 0, -1)
+	else
+		flatForward = flatForward.Unit
+	end
+	local flatRight = Vector3.new(-flatForward.Z, 0, flatForward.X)
+
+	local vel = seat.AssemblyLinearVelocity
+	local flatVel = Vector3.new(vel.X, 0, vel.Z)
+	local forwardSpeed = flatVel:Dot(flatForward)
+	local totalSpeed = flatVel.Magnitude
+
+	-- Estimate front bumper origin from vehicle bounding box
+	local frontOffset = 7.5
+	local okBox, boxCF, boxSize = pcall(function()
+		return veh:GetBoundingBox()
+	end)
+	if okBox and typeof(boxCF) == "CFrame" and typeof(boxSize) == "Vector3" then
+		local halfLen = math.max(boxSize.Z, boxSize.X) * 0.5
+		frontOffset = math.clamp(halfLen, 5, 13)
+	end
+
+	local sensorOrigin = seat.Position + flatForward * (frontOffset * 0.65) + Vector3.new(0, 1.4, 0)
+	return {
+		pos = seat.Position,
+		sensorOrigin = sensorOrigin,
+		forward = flatForward,
+		right = flatRight,
+		forwardSpeed = forwardSpeed,
+		totalSpeed = totalSpeed,
+		frontOffset = frontOffset,
+	}
+end
+
+local function getAChassisTelemetry()
+	local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not pgui then return nil end
+	local iface = pgui:FindFirstChild("A-Chassis Interface")
+	if not iface then return nil end
+	local vals = iface:FindFirstChild("Values")
+	if not vals then return nil end
+
+	local function readNum(name)
+		local v = vals:FindFirstChild(name)
+		if v and (v:IsA("NumberValue") or v:IsA("IntValue")) then
+			return v.Value
+		end
+		return nil
+	end
+	local function readStr(name)
+		local v = vals:FindFirstChild(name)
+		if v and v:IsA("StringValue") then
+			return v.Value
+		end
+		return nil
+	end
+
+	return {
+		rpm = readNum("RPM"),
+		gear = readNum("Gear"),
+		throttle = readNum("Throttle"),
+		brake = readNum("Brake"),
+		transMode = readStr("TransmissionMode"),
+	}
+end
+
+local function getYenValue()
+	local ls = LocalPlayer:FindFirstChild("leaderstats")
+	if not ls then return nil end
+	local yen = ls:FindFirstChild("Yen")
+	if yen and (yen:IsA("IntValue") or yen:IsA("NumberValue")) then
+		return yen.Value
+	end
+	return nil
+end
+
+local function formatNumber(n)
+	local s = tostring(math.floor(n + 0.5))
+	local pos = #s % 3
+	if pos == 0 then pos = 3 end
+	local parts = { s:sub(1, pos) }
+	for i = pos + 1, #s, 3 do
+		table.insert(parts, s:sub(i, i + 2))
+	end
+	return table.concat(parts, ",")
+end
+
+--============================================================================--
+--// 3D Sensor Raycast Engine & Debug Visualizer
+--============================================================================--
+local WHISKER_ANGLES = { -65, -35, -15, 0, 15, 35, 65 }
+
+local function clearDebugRays()
+	for i = #ActiveRayVisuals, 1, -1 do
+		pcall(function()
+			ActiveRayVisuals[i]:Destroy()
+		end)
+		ActiveRayVisuals[i] = nil
+	end
+	if DebugFolder then
+		pcall(function()
+			DebugFolder:Destroy()
+		end)
+		DebugFolder = nil
+	end
+end
+
+local function ensureDebugFolder()
+	if DebugFolder and DebugFolder.Parent then
+		return DebugFolder
+	end
+	DebugFolder = Instance.new("Folder")
+	DebugFolder.Name = "__AllainMRTDebug"
+	DebugFolder.Parent = Workspace
+	return DebugFolder
+end
+
+local function setDebugRayPart(index, origin, targetPos, color)
+	local folder = ensureDebugFolder()
+	local part = ActiveRayVisuals[index]
+	if not part or not part.Parent then
+		part = Instance.new("Part")
+		part.Name = "Ray_" .. tostring(index)
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+		part.Material = Enum.Material.Neon
+		part.Transparency = 0.35
+		part.Parent = folder
+		ActiveRayVisuals[index] = part
+	end
+	local diff = targetPos - origin
+	local dist = diff.Magnitude
+	if dist < 0.1 then
+		part.Transparency = 1
+		return
+	end
+	part.Transparency = 0.35
+	part.Color = color
+	part.Size = Vector3.new(0.18, 0.18, dist)
+	part.CFrame = CFrame.lookAt(origin + diff * 0.5, targetPos)
+end
+
+local function buildRaycastParams(veh)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ignore = {}
+	if LocalPlayer.Character then
+		table.insert(ignore, LocalPlayer.Character)
+	end
+	if veh then
+		table.insert(ignore, veh)
+	end
+	local ownFolder = getOwnVehicleFolder()
+	if ownFolder and ownFolder ~= veh then
+		table.insert(ignore, ownFolder)
+	end
+	if DebugFolder then
+		table.insert(ignore, DebugFolder)
+	end
+	params.FilterDescendantsInstances = ignore
+	params.IgnoreWater = true
+	return params
+end
+
+local function isOtherPlayerVehicle(inst)
+	local vf = Workspace:FindFirstChild("VehiclesFolder")
+	if not vf or not inst:IsDescendantOf(vf) then
 		return false
 	end
-	local lower = str:lower()
-	for _, kw in ipairs(RACE_KEYWORDS) do
-		if lower:find(kw, 1, true) then
-			return true
+	local ownFolder = getOwnVehicleFolder()
+	if ownFolder and inst:IsDescendantOf(ownFolder) then
+		return false
+	end
+	return true
+end
+
+local function scanSensors(veh, kin, lookaheadMult)
+	lookaheadMult = lookaheadMult or 1.0
+	local speed = math.max(kin.forwardSpeed, 0)
+	local centerRange = math.clamp((32 + speed * 0.65) * lookaheadMult, 26, 175)
+	local params = buildRaycastParams(veh)
+	local showDebug = Toggles.ShowSensorRays and Toggles.ShowSensorRays.Value
+	local vf = Workspace:FindFirstChild("VehiclesFolder")
+
+	local rays = {}
+	local minForwardDist = math.huge
+	local hitOtherCarAhead = false
+
+	for idx, deg in ipairs(WHISKER_ANGLES) do
+		local rad = math.rad(deg)
+		local dir = (kin.forward * math.cos(rad) + kin.right * math.sin(rad)).Unit
+		-- Side rays are shorter than forward rays
+		local scale = (deg == 0) and 1.0 or (math.abs(deg) <= 15 and 0.88 or (math.abs(deg) <= 35 and 0.65 or 0.42))
+		local maxDist = centerRange * scale
+
+		local res = Workspace:Raycast(kin.sensorOrigin, dir * maxDist, params)
+		local dist = maxDist
+		local hitCar = false
+		if res and res.Instance and res.Instance.CanCollide then
+			dist = res.Distance
+			if vf and isOtherPlayerVehicle(res.Instance) then
+				hitCar = true
+			end
+		elseif res and res.Instance and not res.Instance.CanCollide then
+			-- Re-cast past non-collidable trigger/decoration if needed
+			local res2 = Workspace:Raycast(res.Position + dir * 1.5, dir * math.max(maxDist - res.Distance - 1.5, 1), params)
+			if res2 and res2.Instance and res2.Instance.CanCollide then
+				dist = res.Distance + 1.5 + res2.Distance
+				if vf and isOtherPlayerVehicle(res2.Instance) then
+					hitCar = true
+				end
+			end
 		end
+
+		local ratio = dist / maxDist
+		rays[idx] = { deg = deg, dist = dist, maxDist = maxDist, ratio = ratio, hitCar = hitCar }
+
+		if math.abs(deg) <= 15 and dist < minForwardDist then
+			minForwardDist = dist
+			if hitCar then
+				hitOtherCarAhead = true
+			end
+		end
+
+		if showDebug then
+			local col = ratio > 0.65 and Color3.fromRGB(60, 230, 110)
+				or (ratio > 0.35 and Color3.fromRGB(245, 200, 60) or Color3.fromRGB(240, 70, 70))
+			setDebugRayPart(idx, kin.sensorOrigin, kin.sensorOrigin + dir * dist, col)
+		end
+	end
+
+	-- Downward road-edge / cliff probes (ahead-left and ahead-right)
+	local edgeAhead = math.clamp(16 + speed * 0.28, 16, 48)
+	local edgeSpread = 10
+	local leftOrigin = kin.pos + kin.forward * edgeAhead - kin.right * edgeSpread + Vector3.new(0, 4, 0)
+	local rightOrigin = kin.pos + kin.forward * edgeAhead + kin.right * edgeSpread + Vector3.new(0, 4, 0)
+	local downVec = Vector3.new(0, -18, 0)
+
+	local leftGround = Workspace:Raycast(leftOrigin, downVec, params)
+	local rightGround = Workspace:Raycast(rightOrigin, downVec, params)
+	local leftCliff = (not leftGround) or (leftGround.Distance > 9.5)
+	local rightCliff = (not rightGround) or (rightGround.Distance > 9.5)
+
+	if showDebug then
+		setDebugRayPart(8, leftOrigin, leftGround and leftGround.Position or (leftOrigin + downVec),
+			leftCliff and Color3.fromRGB(240, 70, 70) or Color3.fromRGB(80, 180, 255))
+		setDebugRayPart(9, rightOrigin, rightGround and rightGround.Position or (rightOrigin + downVec),
+			rightCliff and Color3.fromRGB(240, 70, 70) or Color3.fromRGB(80, 180, 255))
+	else
+		if #ActiveRayVisuals > 0 then
+			clearDebugRays()
+		end
+	end
+
+	return {
+		rays = rays,
+		centerDist = rays[4].dist,
+		centerRatio = rays[4].ratio,
+		minForwardDist = minForwardDist,
+		hitOtherCarAhead = hitOtherCarAhead,
+		leftCliff = leftCliff,
+		rightCliff = rightCliff,
+	}
+end
+
+--============================================================================--
+--// Route Storage (Custom Loop Auto-Drive)
+--============================================================================--
+local function listSavedRoutes()
+	ensureFolders()
+	if type(listfiles) ~= "function" then
+		return {}
+	end
+	local ok, files = pcall(listfiles, "AllainHub/routes")
+	if not ok or type(files) ~= "table" then
+		return {}
+	end
+	local names = {}
+	for _, f in ipairs(files) do
+		local base = tostring(f):match("([^/\\]+)%.json$")
+		if base then
+			table.insert(names, base)
+		end
+	end
+	table.sort(names)
+	return names
+end
+
+local function saveRoute(name, points)
+	if not name or name:match("^%s*$") then
+		return false, "Enter a route name first."
+	end
+	if #points < 5 then
+		return false, "Need at least 5 recorded waypoints."
+	end
+	if type(writefile) ~= "function" then
+		return false, "writefile unavailable on this executor."
+	end
+	ensureFolders()
+	local safeName = name:gsub("[^%w%-%_ ]", ""):gsub("%s+", "_")
+	local path = "AllainHub/routes/" .. safeName .. ".json"
+	local ok, err = pcall(writefile, path, HttpService:JSONEncode(points))
+	if not ok then
+		return false, tostring(err)
+	end
+	return true, safeName
+end
+
+local function loadRoute(name)
+	if not name or name == "" then
+		return false, "Select a route first."
+	end
+	if type(readfile) ~= "function" then
+		return false, "readfile unavailable on this executor."
+	end
+	local path = "AllainHub/routes/" .. name .. ".json"
+	local okRead, raw = pcall(readfile, path)
+	if not okRead or type(raw) ~= "string" then
+		return false, "Could not read " .. path
+	end
+	local okDec, data = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if not okDec or type(data) ~= "table" or #data < 3 then
+		return false, "Invalid route JSON."
+	end
+	LoadedRoutePoints = data
+	LoadedRouteName = name
+	RouteCursor = 1
+	return true, string.format("Loaded %s (%d points)", name, #data)
+end
+
+local function findNearestRouteIndex(pos, points)
+	local bestIdx = 1
+	local bestDist = math.huge
+	for i, pt in ipairs(points) do
+		local dx = pt.x - pos.X
+		local dz = pt.z - pos.Z
+		local d = dx * dx + dz * dz
+		if d < bestDist then
+			bestDist = d
+			bestIdx = i
+		end
+	end
+	return bestIdx, math.sqrt(bestDist)
+end
+
+--============================================================================--
+--// Driving Controllers (Auto-Drive, Collision Prevention, Cruise, Auto-Shift)
+--============================================================================--
+local function computeObstacleAvoidance(sensors)
+	local r = sensors.rays
+	-- Left clearance: rays 1 (-65), 2 (-35), 3 (-15)
+	-- Right clearance: rays 5 (+15), 6 (+35), 7 (+65)
+	local leftScore = r[1].ratio * 0.22 + r[2].ratio * 0.36 + r[3].ratio * 0.42
+	local rightScore = r[7].ratio * 0.22 + r[6].ratio * 0.36 + r[5].ratio * 0.42
+
+	if sensors.leftCliff then leftScore = leftScore - 0.45 end
+	if sensors.rightCliff then rightScore = rightScore - 0.45 end
+
+	-- Positive steer = turn right (away from left obstacles)
+	local steer = (rightScore - leftScore) * 1.45
+
+	-- If dead ahead is blocked, bias firmly toward the more open side
+	if sensors.centerRatio < 0.55 then
+		local urgency = (0.55 - sensors.centerRatio) / 0.55
+		local dir = (rightScore >= leftScore) and 1 or -1
+		steer = steer + dir * urgency * 0.95
+	end
+
+	return math.clamp(steer, -1, 1), leftScore, rightScore
+end
+
+local function stepAutoDrive(veh, kin, dt)
+	local mode = Options.AutoDriveMode and Options.AutoDriveMode.Value or "Free-Roam (Sensors)"
+	local targetSpeed = Options.TargetSpeed and Options.TargetSpeed.Value or 95
+	local lookaheadMult = Options.LookaheadMult and Options.LookaheadMult.Value or 1.0
+	local steerSens = Options.SteerSensitivity and Options.SteerSensitivity.Value or 1.0
+	local stuckEnabled = Toggles.StuckRecovery and Toggles.StuckRecovery.Value
+
+	local sensors = scanSensors(veh, kin, lookaheadMult)
+	local now = os.clock()
+
+	-- Stuck / Reverse recovery
+	if now < ReverseUntil then
+		applyDrivingInputs(0, 0.95, ReverseSteerDir * 0.9, dt)
+		if Library.Labels.DriveStatus then
+			Library.Labels.DriveStatus:SetText("Status: reversing (stuck recovery)")
+		end
+		return
+	end
+
+	local avoidSteer, leftScore, rightScore = computeObstacleAvoidance(sensors)
+	local desiredSteer = avoidSteer
+	local desiredSpeed = targetSpeed
+
+	if mode == "Saved Route Loop" and #LoadedRoutePoints >= 5 then
+		-- Pure-Pursuit along recorded loop
+		local n = #LoadedRoutePoints
+		-- Advance cursor if close to current point
+		local curPt = LoadedRoutePoints[RouteCursor]
+		local curDist = (Vector3.new(curPt.x, kin.pos.Y, curPt.z) - kin.pos).Magnitude
+		if curDist > 160 then
+			RouteCursor = findNearestRouteIndex(kin.pos, LoadedRoutePoints)
+		end
+
+		local lookaheadDist = math.clamp(22 + math.max(kin.forwardSpeed, 0) * 0.38, 22, 75)
+		local targetIdx = RouteCursor
+		local walked = 0
+		for _ = 1, 30 do
+			local pA = LoadedRoutePoints[targetIdx]
+			local nextIdx = (targetIdx % n) + 1
+			local pB = LoadedRoutePoints[nextIdx]
+			local seg = math.sqrt((pB.x - pA.x) ^ 2 + (pB.z - pA.z) ^ 2)
+			walked = walked + seg
+			targetIdx = nextIdx
+			if walked >= lookaheadDist then
+				break
+			end
+		end
+		-- Advance RouteCursor when we pass near it
+		local dToCur = math.sqrt((curPt.x - kin.pos.X) ^ 2 + (curPt.z - kin.pos.Z) ^ 2)
+		if dToCur < 26 then
+			RouteCursor = (RouteCursor % n) + 1
+		end
+
+		local aimPt = LoadedRoutePoints[targetIdx]
+		local toAim = Vector3.new(aimPt.x - kin.pos.X, 0, aimPt.z - kin.pos.Z)
+		if toAim.Magnitude > 1 then
+			toAim = toAim.Unit
+			local cross = kin.forward.X * toAim.Z - kin.forward.Z * toAim.X
+			local dot = math.clamp(kin.forward:Dot(toAim), -1, 1)
+			local angleErr = math.atan2(cross, dot) -- positive = target is to the right
+			local routeSteer = math.clamp(angleErr * 1.35, -1, 1)
+
+			-- Blend with obstacle avoidance when something is close
+			local obstacleWeight = 0
+			if sensors.minForwardDist < 38 or sensors.leftCliff or sensors.rightCliff then
+				obstacleWeight = math.clamp((38 - sensors.minForwardDist) / 28, 0.25, 0.85)
+			end
+			desiredSteer = routeSteer * (1 - obstacleWeight) + avoidSteer * obstacleWeight
+
+			-- Slow for sharp route turns
+			if math.abs(angleErr) > 0.45 then
+				desiredSpeed = math.min(desiredSpeed, targetSpeed * 0.6)
+			end
+		end
+	end
+
+	-- Apply steering sensitivity and smoothing
+	desiredSteer = math.clamp(desiredSteer * steerSens, -1, 1)
+	SmoothedSteer = SmoothedSteer + (desiredSteer - SmoothedSteer) * math.min(dt * 9, 1)
+
+	-- Speed modulation for corners & obstacles
+	local turnSlowdown = 1 - math.abs(SmoothedSteer) * 0.42
+	desiredSpeed = desiredSpeed * math.clamp(turnSlowdown, 0.45, 1)
+
+	if sensors.minForwardDist < 22 then
+		desiredSpeed = 0
+	elseif sensors.minForwardDist < 48 then
+		local f = (sensors.minForwardDist - 22) / 26
+		desiredSpeed = math.min(desiredSpeed, targetSpeed * math.max(f, 0.25))
+	end
+
+	if sensors.hitOtherCarAhead and sensors.minForwardDist < 40 then
+		desiredSpeed = math.min(desiredSpeed, 20)
+	end
+
+	-- Compute throttle / brake
+	local speed = kin.forwardSpeed
+	local throttle, brake = 0, 0
+	if speed < desiredSpeed - 4 then
+		throttle = math.clamp((desiredSpeed - speed) / 25, 0.25, 1)
+	elseif speed > desiredSpeed + 10 then
+		brake = math.clamp((speed - desiredSpeed) / 35, 0.2, 1)
+	elseif desiredSpeed == 0 and speed > 2 then
+		brake = 1
+	end
+
+	-- Stuck detection
+	if stuckEnabled and throttle > 0.2 and math.abs(kin.totalSpeed) < 4 then
+		StuckTimer = StuckTimer + dt
+		if StuckTimer >= 2.0 then
+			StuckTimer = 0
+			ReverseUntil = now + 1.6
+			ReverseSteerDir = (leftScore >= rightScore) and 1 or -1
+			return
+		end
+	else
+		StuckTimer = math.max(0, StuckTimer - dt * 2)
+	end
+
+	applyDrivingInputs(throttle, brake, SmoothedSteer, dt)
+
+	if Library.Labels.DriveStatus then
+		Library.Labels.DriveStatus:SetText(string.format(
+			"Status: %s | %.0f/%.0f st/s | Steer %.2f",
+			mode == "Saved Route Loop" and ("Loop: " .. LoadedRouteName) or "Free-Roam",
+			speed,
+			desiredSpeed,
+			SmoothedSteer
+		))
+	end
+end
+
+local function stepCollisionPrevention(veh, kin, dt)
+	local minSpeed = Options.ColMinSpeed and Options.ColMinSpeed.Value or 25
+	local ttcThreshold = Options.ColTTC and Options.ColTTC.Value or 0.9
+	local colMode = Options.ColMode and Options.ColMode.Value or "Both (Brake + Steer)"
+
+	local sensors = scanSensors(veh, kin, 1.0)
+	local speed = kin.forwardSpeed
+	if speed < minSpeed then
+		-- Release only keys we might have been holding
+		releaseAllDrivingKeys()
+		if Library.Labels.AssistStatus then
+			Library.Labels.AssistStatus:SetText("Assist: standby (below min speed)")
+		end
+		return false
+	end
+
+	local ttc = sensors.minForwardDist / math.max(speed, 1)
+	local closeSideHazard = sensors.leftCliff or sensors.rightCliff or sensors.rays[2].dist < 10 or sensors.rays[6].dist < 10
+
+	if ttc <= ttcThreshold or closeSideHazard then
+		local avoidSteer = computeObstacleAvoidance(sensors)
+		local doBrake = (colMode == "Brake Only" or colMode == "Both (Brake + Steer)") and (ttc <= ttcThreshold)
+		local doSteer = (colMode == "Steer Only" or colMode == "Both (Brake + Steer)")
+
+		local brakeAmt = doBrake and math.clamp(1.2 - (ttc / math.max(ttcThreshold, 0.1)), 0.45, 1) or 0
+		local steerAmt = doSteer and avoidSteer or 0
+
+		applyDrivingInputs(0, brakeAmt, steerAmt, dt)
+		if Library.Labels.AssistStatus then
+			Library.Labels.AssistStatus:SetText(string.format(
+				"Assist: INTERVENING! TTC=%.2fs (%.0f st)",
+				ttc,
+				sensors.minForwardDist
+			))
+		end
+		return true
+	end
+
+	releaseAllDrivingKeys()
+	if Library.Labels.AssistStatus then
+		Library.Labels.AssistStatus:SetText(string.format("Assist: clear (ahead %.0f st)", sensors.minForwardDist))
 	end
 	return false
 end
 
-local function dumpTree(lines, root, maxDepth, maxLines, indent, state)
-	state = state or { count = 0, truncated = false }
-	if state.count >= maxLines then
-		state.truncated = true
+local function stepCruiseControl(kin, dt)
+	-- Pause if user manually holds Brake
+	if UserInputService:IsKeyDown(ControlKeys.Brake) then
+		setKey(ControlKeys.Throttle, false)
 		return
 	end
-	local ok, children = pcall(function()
-		return root:GetChildren()
-	end)
-	if not ok or type(children) ~= "table" then
-		return
+	local target = Options.CruiseSpeed and Options.CruiseSpeed.Value or 90
+	local speed = kin.forwardSpeed
+	if speed < target - 2 then
+		local thr = math.clamp((target - speed) / 20, 0.25, 1)
+		PwmPhase = (PwmPhase + dt * 10) % 1
+		setKey(ControlKeys.Throttle, thr >= 0.85 or PwmPhase < thr)
+	else
+		setKey(ControlKeys.Throttle, false)
 	end
+end
 
-	table.sort(children, function(a, b)
-		if a.Name == b.Name then
-			return a.ClassName < b.ClassName
+local function stepAutoShift()
+	local tele = getAChassisTelemetry()
+	if not tele or not tele.rpm or not tele.gear then
+		return
+	end
+	if tele.transMode and tele.transMode:lower():find("auto", 1, true) then
+		return
+	end
+	local now = os.clock()
+	if now - LastShiftTime < 0.45 then
+		return
+	end
+	local upRpm = Options.ShiftUpRPM and Options.ShiftUpRPM.Value or 7200
+	local downRpm = Options.ShiftDownRPM and Options.ShiftDownRPM.Value or 3200
+	if tele.gear >= 1 and tele.rpm >= upRpm then
+		LastShiftTime = now
+		tapKey(ControlKeys.ShiftUp, 0.05)
+	elseif tele.gear > 1 and tele.rpm > 500 and tele.rpm <= downRpm then
+		LastShiftTime = now
+		tapKey(ControlKeys.ShiftDown, 0.05)
+	end
+end
+
+--============================================================================--
+--// Events, ESP & Vehicle QoL Helpers
+--============================================================================--
+local function getEventsList()
+	local list = {}
+	local triggers = Workspace:FindFirstChild("Proximity Triggers")
+	if not triggers then return list end
+
+	local pPos = getPlayerPos()
+	for _, child in ipairs(triggers:GetChildren()) do
+		local focus = child:FindFirstChild("Focus")
+		local eventName = (focus and focus:GetAttribute("EventName")) or nil
+		if eventName then
+			local pos = focus.Position
+			local dist = pPos and (pos - pPos).Magnitude or 0
+			table.insert(list, { name = tostring(eventName), inst = focus, pos = pos, dist = dist, kind = "Event" })
+		elseif child.Name == "Bodykits" or child.Name == "Tuner" or child.Name == "VehicleDealership" then
+			if child:IsA("BasePart") then
+				local dist = pPos and (child.Position - pPos).Magnitude or 0
+				table.insert(list, { name = child.Name, inst = child, pos = child.Position, dist = dist, kind = "Shop" })
+			end
 		end
-		return a.Name < b.Name
-	end)
+	end
+	table.sort(list, function(a, b) return a.name < b.name end)
+	return list
+end
 
-	local pad = string.rep("  ", indent)
-	for _, child in ipairs(children) do
-		if state.count >= maxLines then
-			state.truncated = true
+local function clearEspTable(tbl)
+	for i = #tbl, 1, -1 do
+		pcall(function()
+			tbl[i]:Destroy()
+		end)
+		tbl[i] = nil
+	end
+end
+
+local function makeBillboard(adornee, text, color)
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "__AllainMRTEsp"
+	bb.Adornee = adornee
+	bb.AlwaysOnTop = true
+	bb.Size = UDim2.fromOffset(180, 36)
+	bb.StudsOffset = Vector3.new(0, 6, 0)
+	bb.MaxDistance = 8000
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.fromScale(1, 1)
+	lbl.BackgroundTransparency = 0.35
+	lbl.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
+	lbl.TextColor3 = color
+	lbl.TextStrokeTransparency = 0.4
+	lbl.Font = Enum.Font.GothamSemibold
+	lbl.TextSize = 12
+	lbl.Text = text
+	lbl.Parent = bb
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 4)
+	corner.Parent = lbl
+
+	bb.Parent = Workspace
+	return bb, lbl
+end
+
+local function refreshEventEsp()
+	clearEspTable(EventEspObjects)
+	if not (Toggles.EventEsp and Toggles.EventEsp.Value) then
+		return
+	end
+	for _, ev in ipairs(getEventsList()) do
+		local col = ev.kind == "Event" and Color3.fromRGB(100, 210, 255) or Color3.fromRGB(255, 200, 90)
+		local bb, lbl = makeBillboard(ev.inst, ev.name, col)
+		bb:SetAttribute("BaseName", ev.name)
+		table.insert(EventEspObjects, bb)
+	end
+end
+
+local function refreshCarEsp()
+	clearEspTable(CarEspObjects)
+	if not (Toggles.CarEsp and Toggles.CarEsp.Value) then
+		return
+	end
+	local vf = Workspace:FindFirstChild("VehiclesFolder")
+	if not vf then return end
+	for _, playerFolder in ipairs(vf:GetChildren()) do
+		if playerFolder.Name ~= LocalPlayer.Name then
+			for _, car in ipairs(playerFolder:GetChildren()) do
+				if car:IsA("Model") then
+					local seat = car:FindFirstChild("DriveSeat") or car.PrimaryPart
+					if seat and seat:IsA("BasePart") then
+						local bb = makeBillboard(seat, playerFolder.Name .. " | " .. car.Name, Color3.fromRGB(255, 130, 130))
+						bb:SetAttribute("BaseName", playerFolder.Name .. " · " .. car.Name)
+						table.insert(CarEspObjects, bb)
+					end
+				end
+			end
+		end
+	end
+end
+
+local function enterOwnCar()
+	local ownFolder = getOwnVehicleFolder()
+	if not ownFolder then
+		Library:Notify("No spawned car found in VehiclesFolder.", 3)
+		return
+	end
+	for _, car in ipairs(ownFolder:GetChildren()) do
+		local seat = car:FindFirstChild("DriveSeat")
+		local att = seat and seat:FindFirstChild("Attachment")
+		local prompt = att and att:FindFirstChildOfClass("ProximityPrompt")
+		if prompt then
+			if type(fireproximityprompt) == "function" then
+				pcall(fireproximityprompt, prompt)
+				Library:Notify("Triggered driver seat prompt for " .. car.Name, 3)
+			else
+				Library:Notify("Walk near your " .. car.Name .. " (fireproximityprompt unavailable).", 3)
+			end
 			return
 		end
-		state.count = state.count + 1
+	end
+	Library:Notify("Could not find DriveSeat prompt on your car.", 3)
+end
 
+local function setFpsBoost(enabled)
+	if enabled then
+		if not SavedLighting then
+			SavedLighting = {
+				GlobalShadows = Lighting.GlobalShadows,
+				FogEnd = Lighting.FogEnd,
+			}
+		end
+		pcall(function()
+			Lighting.GlobalShadows = false
+			Lighting.FogEnd = 1e6
+		end)
+		for _, d in ipairs(Workspace:GetDescendants()) do
+			if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam") then
+				pcall(function() d.Enabled = false end)
+			end
+		end
+	else
+		if SavedLighting then
+			pcall(function()
+				Lighting.GlobalShadows = SavedLighting.GlobalShadows
+				Lighting.FogEnd = SavedLighting.FogEnd
+			end)
+			SavedLighting = nil
+		end
+	end
+end
+
+local function setLowPower(enabled)
+	LowPowerActive = enabled
+	pcall(function()
+		RunService:Set3dRenderingEnabled(not enabled)
+	end)
+	if enabled and type(setfpscap) == "function" then
+		local cap = Options.LowPowerFpsCap and Options.LowPowerFpsCap.Value or 20
+		pcall(setfpscap, cap)
+	elseif not enabled and type(setfpscap) == "function" then
+		pcall(setfpscap, 0)
+	end
+end
+
+--============================================================================--
+--// Webhook Helper (Shared by Alerts & Scanner)
+--============================================================================--
+local function sendWebhookText(webhookUrl, message)
+	if type(webhookUrl) ~= "string" or webhookUrl:match("^%s*$") then
+		return false, "Webhook URL is empty"
+	end
+	local req = getRequestFunc()
+	if not req then
+		return false, "HTTP request function unavailable"
+	end
+	local ok, res = pcall(req, {
+		Url = webhookUrl,
+		Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = HttpService:JSONEncode({ content = message }),
+	})
+	if not ok then return false, tostring(res) end
+	local status = type(res) == "table" and (res.StatusCode or res.Status) or nil
+	if status and (status < 200 or status >= 300) then
+		return false, "HTTP " .. tostring(status)
+	end
+	return true, "Sent"
+end
+
+local function sendReportToWebhook(webhookUrl, filename, content, summaryText)
+	if type(webhookUrl) ~= "string" or webhookUrl:match("^%s*$") then
+		return false, "Webhook URL is empty"
+	end
+	local req = getRequestFunc()
+	if not req then
+		return false, "Executor HTTP request function not available"
+	end
+	local boundary = "----AllainMRTBoundary" .. tostring(math.random(100000, 999999))
+	local payloadJson = HttpService:JSONEncode({
+		content = summaryText or ("Midnight Racing: Tokyo scan (`" .. filename .. "`)"),
+	})
+	local bodyParts = {
+		"--" .. boundary .. "\r\n",
+		'Content-Disposition: form-data; name="payload_json"\r\n',
+		"Content-Type: application/json\r\n\r\n",
+		payloadJson .. "\r\n",
+		"--" .. boundary .. "\r\n",
+		string.format('Content-Disposition: form-data; name="files[0]"; filename="%s"\r\n', filename),
+		"Content-Type: text/plain; charset=utf-8\r\n\r\n",
+		content .. "\r\n",
+		"--" .. boundary .. "--\r\n",
+	}
+	local ok, res = pcall(req, {
+		Url = webhookUrl,
+		Method = "POST",
+		Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
+		Body = table.concat(bodyParts),
+	})
+	if not ok then return false, tostring(res) end
+	local status = type(res) == "table" and (res.StatusCode or res.Status) or nil
+	if status and (status < 200 or status >= 300) then
+		return false, "HTTP " .. tostring(status)
+	end
+	return true, "Sent (" .. tostring(status or "OK") .. ")"
+end
+
+--============================================================================--
+--// Scanner Helpers (Preserved from v0.1)
+--============================================================================--
+local function safeFullName(inst)
+	if not inst then return "nil" end
+	local ok, path = pcall(function() return inst:GetFullName() end)
+	return ok and path or tostring(inst)
+end
+
+local function fmtVec3(v)
+	if typeof(v) ~= "Vector3" then return tostring(v) end
+	return string.format("(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z)
+end
+
+local function fmtValue(v, depth)
+	depth = depth or 0
+	local t = typeof(v)
+	if t == "Vector3" then return fmtVec3(v)
+	elseif t == "CFrame" then return "CF" .. fmtVec3(v.Position)
+	elseif t == "Color3" then return string.format("RGB(%d,%d,%d)", math.floor(v.R * 255), math.floor(v.G * 255), math.floor(v.B * 255))
+	elseif t == "Instance" then return "<" .. v.ClassName .. ":" .. safeFullName(v) .. ">"
+	elseif t == "string" then
+		local clean = v:gsub("[\r\n]+", " ")
+		if #clean > 120 then clean = clean:sub(1, 120) .. "..." end
+		return string.format("%q", clean)
+	elseif t == "table" then
+		if depth >= 2 then return "{...}" end
+		local parts, count = {}, 0
+		for k, val in pairs(v) do
+			count = count + 1
+			if count > 8 then table.insert(parts, "...") break end
+			table.insert(parts, tostring(k) .. "=" .. fmtValue(val, depth + 1))
+		end
+		return "{" .. table.concat(parts, ", ") .. "}"
+	end
+	return tostring(v)
+end
+
+local function fmtAttributes(inst)
+	local ok, attrs = pcall(function() return inst:GetAttributes() end)
+	if not ok or type(attrs) ~= "table" then return "" end
+	local parts = {}
+	for k, v in pairs(attrs) do
+		table.insert(parts, k .. "=" .. fmtValue(v, 1))
+	end
+	if #parts == 0 then return "" end
+	table.sort(parts)
+	return " [attrs: " .. table.concat(parts, ", ") .. "]"
+end
+
+local function dumpTree(lines, root, maxDepth, maxLines, indent, state)
+	state = state or { count = 0, truncated = false }
+	if state.count >= maxLines then state.truncated = true return end
+	local ok, children = pcall(function() return root:GetChildren() end)
+	if not ok or type(children) ~= "table" then return end
+	table.sort(children, function(a, b) return a.Name < b.Name end)
+	local pad = string.rep("  ", indent)
+	for _, child in ipairs(children) do
+		if state.count >= maxLines then state.truncated = true return end
+		state.count = state.count + 1
 		local extra = ""
 		if child:IsA("ValueBase") then
-			local okV, val = pcall(function()
-				return child.Value
-			end)
-			if okV then
-				extra = " = " .. fmtValue(val, 1)
-			end
-		elseif child:IsA("ProximityPrompt") then
-			extra = string.format(
-				" [Action=%q Object=%q Hold=%.2f Dist=%.1f]",
-				child.ActionText,
-				child.ObjectText,
-				child.HoldDuration,
-				child.MaxActivationDistance
-			)
-		elseif child:IsA("VehicleSeat") then
-			extra = string.format(
-				" [MaxSpeed=%.1f Torque=%.1f Turn=%.2f]",
-				child.MaxSpeed,
-				child.Torque,
-				child.TurnSpeed
-			)
+			local okV, val = pcall(function() return child.Value end)
+			if okV then extra = " = " .. fmtValue(val, 1) end
 		end
-
-		local grandOk, grandChildren = pcall(function()
-			return child:GetChildren()
-		end)
-		local grandCount = (grandOk and type(grandChildren) == "table") and #grandChildren or 0
-		local countTag = grandCount > 0 and (" (" .. grandCount .. " children)") or ""
-
-		table.insert(lines, string.format("%s- %s [%s]%s%s%s", pad, child.Name, child.ClassName, countTag, extra, fmtAttributes(child)))
-
-		if grandCount > 0 and indent < maxDepth then
+		local gOk, gKids = pcall(function() return child:GetChildren() end)
+		local gCount = (gOk and type(gKids) == "table") and #gKids or 0
+		table.insert(lines, string.format("%s- %s [%s]%s%s%s", pad, child.Name, child.ClassName,
+			gCount > 0 and (" (" .. gCount .. " children)") or "", extra, fmtAttributes(child)))
+		if gCount > 0 and indent < maxDepth then
 			dumpTree(lines, child, maxDepth, maxLines, indent + 1, state)
 		end
 	end
@@ -353,592 +1245,515 @@ local function appendSection(lines, title)
 	table.insert(lines, "====================================================================")
 end
 
---// Scanner Sections \\--
 local function scanHeaderAndPlayer(lines)
 	appendSection(lines, "GAME & LOCAL PLAYER")
-	local okInfo, info = pcall(function()
-		return MarketplaceService:GetProductInfo(game.PlaceId)
-	end)
+	local okInfo, info = pcall(function() return MarketplaceService:GetProductInfo(game.PlaceId) end)
 	local placeName = (okInfo and type(info) == "table" and info.Name) or "unknown"
-
-	table.insert(lines, string.format("Timestamp:    %s", os.date("%Y-%m-%d %H:%M:%S")))
-	table.insert(lines, string.format("PlaceName:    %s", tostring(placeName)))
-	table.insert(lines, string.format("GameId:       %d", game.GameId))
-	table.insert(lines, string.format("PlaceId:      %d", game.PlaceId))
-	table.insert(lines, string.format("PlaceVersion: %d", game.PlaceVersion))
-	table.insert(lines, string.format("JobId:        %s", tostring(game.JobId)))
-	table.insert(lines, string.format("Player:       %s (UserId %d)", LocalPlayer.Name, LocalPlayer.UserId))
-	table.insert(lines, string.format("Team:         %s", LocalPlayer.Team and LocalPlayer.Team.Name or "none"))
-	table.insert(lines, string.format("PlayerPos:    %s", fmtVec3(getPlayerPos())))
-	table.insert(lines, "PlayerAttrs: " .. (fmtAttributes(LocalPlayer) ~= "" and fmtAttributes(LocalPlayer) or " none"))
-
-	table.insert(lines, "")
-	table.insert(lines, "-- LocalPlayer children (leaderstats / data folders) --")
-	for _, child in ipairs(LocalPlayer:GetChildren()) do
-		if child.Name ~= "PlayerGui" and child.Name ~= "PlayerScripts" and child.Name ~= "Backpack" and child.Name ~= "StarterGear" then
-			table.insert(lines, string.format("- %s [%s]%s", child.Name, child.ClassName, fmtAttributes(child)))
-			if child:IsA("Folder") or child:IsA("Configuration") or child:IsA("Model") then
-				dumpTree(lines, child, 3, 200, 1)
-			elseif child:IsA("ValueBase") then
-				local okV, val = pcall(function() return child.Value end)
-				if okV then
-					lines[#lines] = lines[#lines] .. " = " .. fmtValue(val, 1)
-				end
-			end
-		end
-	end
+	table.insert(lines, "Timestamp: " .. os.date("%Y-%m-%d %H:%M:%S"))
+	table.insert(lines, "PlaceName: " .. tostring(placeName))
+	table.insert(lines, string.format("GameId: %d | PlaceId: %d", game.GameId, game.PlaceId))
+	table.insert(lines, string.format("Player: %s | Pos: %s | Yen: %s", LocalPlayer.Name, fmtVec3(getPlayerPos()), tostring(getYenValue())))
 end
 
 local function scanVehicle(lines, maxDepth)
-	appendSection(lines, "CURRENT VEHICLE & SEATED STATE")
+	appendSection(lines, "CURRENT VEHICLE")
 	local veh, seat = getSeatedVehicle()
 	if not veh then
-		table.insert(lines, "Player is NOT currently seated in a vehicle.")
-	else
-		table.insert(lines, "Vehicle: " .. safeFullName(veh) .. " [" .. veh.ClassName .. "]" .. fmtAttributes(veh))
-		if seat then
-			table.insert(lines, "Seat:    " .. safeFullName(seat) .. " [" .. seat.ClassName .. "]" .. fmtAttributes(seat))
-			if seat:IsA("VehicleSeat") then
-				table.insert(lines, string.format(
-					"SeatPhysics: MaxSpeed=%.1f Torque=%.1f TurnSpeed=%.2f Throttle=%.2f Steer=%.2f Speed=%.1f",
-					seat.MaxSpeed, seat.Torque, seat.TurnSpeed, seat.ThrottleFloat, seat.SteerFloat,
-					seat.AssemblyLinearVelocity.Magnitude
-				))
-			end
-		end
-		if veh:IsA("Model") then
-			table.insert(lines, "PrimaryPart: " .. (veh.PrimaryPart and veh.PrimaryPart.Name or "none"))
-			local okP, cf = pcall(function() return veh:GetPivot() end)
-			if okP then
-				table.insert(lines, "PivotPos:    " .. fmtVec3(cf.Position))
-			end
-		end
-		table.insert(lines, "")
-		table.insert(lines, "-- Vehicle Hierarchy --")
-		local st = { count = 0, truncated = false }
-		dumpTree(lines, veh, maxDepth or 3, 350, 0, st)
-		if st.truncated then
-			table.insert(lines, "  ... (truncated at 350 lines)")
-		end
-	end
-
-	-- Also check for vehicle containers in Workspace
-	table.insert(lines, "")
-	table.insert(lines, "-- Workspace Vehicle/Car Containers --")
-	local foundVehFolder = false
-	for _, child in ipairs(Workspace:GetChildren()) do
-		local n = child.Name:lower()
-		if n:find("veh", 1, true) or n:find("car", 1, true) or n:find("chassis", 1, true) then
-			foundVehFolder = true
-			local kids = child:GetChildren()
-			table.insert(lines, string.format("- %s [%s] (%d children)%s", child.Name, child.ClassName, #kids, fmtAttributes(child)))
-			for i = 1, math.min(#kids, 25) do
-				local k = kids[i]
-				table.insert(lines, string.format("    * %s [%s]%s", k.Name, k.ClassName, fmtAttributes(k)))
-			end
-			if #kids > 25 then
-				table.insert(lines, string.format("    ... (+%d more)", #kids - 25))
-			end
-		end
-	end
-	if not foundVehFolder then
-		table.insert(lines, "(No top-level Workspace folder matched veh/car/chassis)")
-	end
-end
-
-local function scanWorkspaceOverview(lines, maxDepth)
-	appendSection(lines, "WORKSPACE TOP-LEVEL & RACE/TRACK OBJECTS")
-	local top = Workspace:GetChildren()
-	table.sort(top, function(a, b) return a.Name < b.Name end)
-	table.insert(lines, string.format("Top-level children (%d):", #top))
-	for _, child in ipairs(top) do
-		local kids = child:GetChildren()
-		table.insert(lines, string.format("- %s [%s] (%d children)%s", child.Name, child.ClassName, #kids, fmtAttributes(child)))
-	end
-
-	table.insert(lines, "")
-	table.insert(lines, "-- Keyword-Matched Workspace Trees (race/checkpoint/track/dealer/garage/etc.) --")
-	local state = { count = 0, truncated = false }
-	for _, child in ipairs(top) do
-		if matchesKeyword(child.Name) and not Players:FindFirstChild(child.Name) then
-			table.insert(lines, string.format("\n[%s] (%s):", child.Name, child.ClassName))
-			dumpTree(lines, child, maxDepth or 3, 500, 1, state)
-			if state.truncated then
-				table.insert(lines, "  ... (workspace keyword dump cap reached)")
-				break
-			end
-		end
-	end
-end
-
-local function scanPromptsAndTriggers(lines, maxDist)
-	appendSection(lines, "PROXIMITY PROMPTS, CLICK DETECTORS & RACE TRIGGERS")
-	local pPos = getPlayerPos()
-	local prompts = {}
-	local clicks = {}
-	local touchParts = {}
-
-	for _, desc in ipairs(Workspace:GetDescendants()) do
-		if desc:IsA("ProximityPrompt") then
-			local pos = getInstPosition(desc)
-			local dist = (pPos and pos) and (pos - pPos).Magnitude or math.huge
-			if not maxDist or dist <= maxDist then
-				table.insert(prompts, { inst = desc, pos = pos, dist = dist })
-			end
-		elseif desc:IsA("ClickDetector") then
-			local pos = getInstPosition(desc)
-			local dist = (pPos and pos) and (pos - pPos).Magnitude or math.huge
-			if not maxDist or dist <= maxDist then
-				table.insert(clicks, { inst = desc, pos = pos, dist = dist })
-			end
-		elseif desc:IsA("TouchTransmitter") and desc.Parent and desc.Parent:IsA("BasePart") then
-			local part = desc.Parent
-			if matchesKeyword(part.Name) or (part.Parent and matchesKeyword(part.Parent.Name)) then
-				local pos = part.Position
-				local dist = pPos and (pos - pPos).Magnitude or math.huge
-				if not maxDist or dist <= maxDist then
-					table.insert(touchParts, { inst = part, pos = pos, dist = dist })
-				end
-			end
-		end
-	end
-
-	table.sort(prompts, function(a, b) return a.dist < b.dist end)
-	table.sort(clicks, function(a, b) return a.dist < b.dist end)
-	table.sort(touchParts, function(a, b) return a.dist < b.dist end)
-
-	table.insert(lines, string.format("ProximityPrompts found: %d", #prompts))
-	for i = 1, math.min(#prompts, 120) do
-		local item = prompts[i]
-		local p = item.inst
-		local distStr = item.dist < math.huge and string.format("%.1f studs", item.dist) or "?"
-		table.insert(lines, string.format(
-			"  [%d] %s | Action=%q Object=%q Hold=%.2f Enabled=%s | %s (%s)",
-			i, safeFullName(p), p.ActionText, p.ObjectText, p.HoldDuration, tostring(p.Enabled), fmtVec3(item.pos), distStr
-		))
-	end
-
-	table.insert(lines, "")
-	table.insert(lines, string.format("ClickDetectors found: %d", #clicks))
-	for i = 1, math.min(#clicks, 60) do
-		local item = clicks[i]
-		local distStr = item.dist < math.huge and string.format("%.1f studs", item.dist) or "?"
-		table.insert(lines, string.format("  [%d] %s | %s (%s)", i, safeFullName(item.inst), fmtVec3(item.pos), distStr))
-	end
-
-	table.insert(lines, "")
-	table.insert(lines, string.format("Keyword-matched TouchTransmitter parts found: %d", #touchParts))
-	for i = 1, math.min(#touchParts, 120) do
-		local item = touchParts[i]
-		local distStr = item.dist < math.huge and string.format("%.1f studs", item.dist) or "?"
-		table.insert(lines, string.format(
-			"  [%d] %s | Size=%s | %s (%s)%s",
-			i, safeFullName(item.inst), fmtVec3(item.inst.Size), fmtVec3(item.pos), distStr, fmtAttributes(item.inst)
-		))
-	end
-end
-
-local function scanRemotes(lines)
-	appendSection(lines, "REMOTES & BINDABLES")
-	local containers = {
-		{ name = "ReplicatedStorage", inst = ReplicatedStorage },
-		{ name = "ReplicatedFirst", inst = ReplicatedFirst },
-		{ name = "Workspace", inst = Workspace },
-		{ name = "StarterGui", inst = StarterGui },
-		{ name = "StarterPack", inst = StarterPack },
-		{ name = "StarterPlayer", inst = StarterPlayer },
-		{ name = "LocalPlayer", inst = LocalPlayer },
-	}
-
-	local total = 0
-	for _, entry in ipairs(containers) do
-		local found = {}
-		local ok, descs = pcall(function()
-			return entry.inst:GetDescendants()
-		end)
-		if ok and type(descs) == "table" then
-			for _, d in ipairs(descs) do
-				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent")
-					or d:IsA("BindableEvent") or d:IsA("BindableFunction") then
-					table.insert(found, string.format("  [%s] %s", d.ClassName, safeFullName(d)))
-				end
-			end
-		end
-		if #found > 0 then
-			table.sort(found)
-			total = total + #found
-			table.insert(lines, string.format("-- %s (%d) --", entry.name, #found))
-			for _, line in ipairs(found) do
-				table.insert(lines, line)
-			end
-		end
-	end
-	table.insert(lines, string.format("Total remotes/bindables: %d", total))
-end
-
-local function scanReplicatedStorage(lines, maxDepth)
-	appendSection(lines, "REPLICATED STORAGE TREE")
-	local state = { count = 0, truncated = false }
-	dumpTree(lines, ReplicatedStorage, maxDepth or 4, 800, 0, state)
-	if state.truncated then
-		table.insert(lines, "... (truncated at 800 lines)")
-	end
-end
-
-local function scanPlayerGui(lines)
-	appendSection(lines, "PLAYER GUI (SCREENGUIS & VISIBLE TEXT)")
-	local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	if not pgui then
-		table.insert(lines, "PlayerGui not found.")
+		table.insert(lines, "Not seated in a vehicle.")
 		return
 	end
-	local guis = pgui:GetChildren()
-	table.sort(guis, function(a, b) return a.Name < b.Name end)
-	for _, gui in ipairs(guis) do
-		if gui:IsA("ScreenGui") then
-			table.insert(lines, string.format("- %s [Enabled=%s, Children=%d]", gui.Name, tostring(gui.Enabled), #gui:GetChildren()))
-			if gui.Enabled then
-				local texts = {}
-				for _, d in ipairs(gui:GetDescendants()) do
-					if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
-						local txt = (d.Text or ""):gsub("[\r\n]+", " "):match("^%s*(.-)%s*$")
-						if txt ~= "" and #texts < 40 then
-							table.insert(texts, string.format("    [%s] %s = %q", d.ClassName, d.Name, txt:sub(1, 100)))
-						end
-					end
-				end
-				for _, t in ipairs(texts) do
-					table.insert(lines, t)
-				end
-			end
-		else
-			table.insert(lines, string.format("- %s [%s]", gui.Name, gui.ClassName))
-		end
+	table.insert(lines, "Vehicle: " .. safeFullName(veh) .. fmtAttributes(veh))
+	table.insert(lines, "Seat:    " .. safeFullName(seat))
+	local tele = getAChassisTelemetry()
+	if tele then
+		table.insert(lines, string.format("A-Chassis: Gear=%s RPM=%s Mode=%s", tostring(tele.gear), tostring(tele.rpm), tostring(tele.transMode)))
 	end
-end
-
-local function scanCollectionTags(lines)
-	appendSection(lines, "COLLECTION SERVICE TAGS")
-	local ok, tags = pcall(function()
-		return CollectionService:GetAllTags()
-	end)
-	if not ok or type(tags) ~= "table" then
-		table.insert(lines, "(CollectionService:GetAllTags unavailable)")
-		return
-	end
-	table.sort(tags)
-	table.insert(lines, string.format("Tags (%d):", #tags))
-	for _, tag in ipairs(tags) do
-		local okT, tagged = pcall(function()
-			return CollectionService:GetTagged(tag)
-		end)
-		local count = (okT and type(tagged) == "table") and #tagged or 0
-		local sample = (count > 0) and safeFullName(tagged[1]) or "none"
-		table.insert(lines, string.format("  - %s (%d) | sample: %s", tag, count, sample))
-	end
-end
-
---// Export Helpers \\--
-local function saveReportToFile(filename, content)
-	if type(writefile) ~= "function" then
-		return false, "writefile not available on this executor"
-	end
-	pcall(function()
-		if type(isfolder) == "function" and type(makefolder) == "function" then
-			if not isfolder("AllainHub") then makefolder("AllainHub") end
-			if not isfolder("AllainHub/scans") then makefolder("AllainHub/scans") end
-		end
-	end)
-	local path = "AllainHub/scans/" .. filename
-	local ok, err = pcall(writefile, path, content)
-	if not ok then
-		return false, tostring(err)
-	end
-	return true, path
-end
-
-local function sendReportToWebhook(webhookUrl, filename, content, summaryText)
-	if type(webhookUrl) ~= "string" or webhookUrl:match("^%s*$") then
-		return false, "Webhook URL is empty"
-	end
-	local req = getRequestFunc()
-	if not req then
-		return false, "Executor HTTP request function not available"
-	end
-
-	local boundary = "----AllainMRTBoundary" .. tostring(math.random(100000, 999999))
-	local payloadJson = HttpService:JSONEncode({
-		content = summaryText or ("Midnight Racing: Tokyo scan (`" .. filename .. "`)"),
-	})
-
-	local bodyParts = {
-		"--" .. boundary .. "\r\n",
-		'Content-Disposition: form-data; name="payload_json"\r\n',
-		"Content-Type: application/json\r\n\r\n",
-		payloadJson .. "\r\n",
-		"--" .. boundary .. "\r\n",
-		string.format('Content-Disposition: form-data; name="files[0]"; filename="%s"\r\n', filename),
-		"Content-Type: text/plain; charset=utf-8\r\n\r\n",
-		content .. "\r\n",
-		"--" .. boundary .. "--\r\n",
-	}
-
-	local ok, res = pcall(req, {
-		Url = webhookUrl,
-		Method = "POST",
-		Headers = {
-			["Content-Type"] = "multipart/form-data; boundary=" .. boundary,
-		},
-		Body = table.concat(bodyParts),
-	})
-	if not ok then
-		return false, tostring(res)
-	end
-	local status = type(res) == "table" and (res.StatusCode or res.Status) or nil
-	if status and (status < 200 or status >= 300) then
-		return false, "HTTP " .. tostring(status)
-	end
-	return true, "Sent (" .. tostring(status or "OK") .. ")"
-end
-
-local function updateStatus(msg)
-	if Library.Labels and Library.Labels.ScanStatus then
-		Library.Labels.ScanStatus:SetText("Status: " .. msg)
-	end
+	dumpTree(lines, veh, maxDepth or 3, 350, 0)
 end
 
 local function finalizeReport(prefix, lines)
 	local content = table.concat(lines, "\n")
-	local stamp = os.date("%Y%m%d_%H%M%S")
-	local filename = string.format("%s_%s.txt", prefix, stamp)
+	local filename = string.format("%s_%s.txt", prefix, os.date("%Y%m%d_%H%M%S"))
 	LastReportText = content
 	LastReportName = filename
-
-	local kb = #content / 1024
-	local statusParts = { string.format("%d lines (%.1f KB)", #lines, kb) }
-
-	local savedOk, savedInfo = saveReportToFile(filename, content)
-	if savedOk then
-		table.insert(statusParts, "saved: " .. savedInfo)
+	ensureFolders()
+	local savedMsg = ""
+	if type(writefile) == "function" then
+		local path = "AllainHub/scans/" .. filename
+		if pcall(writefile, path, content) then
+			savedMsg = " | saved: " .. path
+		end
 	end
-
 	if Toggles.AutoSendWebhook and Toggles.AutoSendWebhook.Value then
 		local url = Options.WebhookUrl and Options.WebhookUrl.Value or ""
 		if url ~= "" then
-			local whOk, whMsg = sendReportToWebhook(
-				url,
-				filename,
-				content,
-				string.format("**Midnight Racing: Tokyo** — `%s` (%d lines, %.1f KB)", filename, #lines, kb)
-			)
-			table.insert(statusParts, whOk and "webhook sent" or ("webhook err: " .. whMsg))
+			sendReportToWebhook(url, filename, content)
 		end
 	end
+	local summary = string.format("%d lines (%.1f KB)%s", #lines, #content / 1024, savedMsg)
+	if Library.Labels.ScanStatus then
+		Library.Labels.ScanStatus:SetText("Status: " .. summary)
+	end
+	Library:Notify({ Title = "Scan Complete", Description = summary, Time = 4 })
+end
 
-	local summary = table.concat(statusParts, " | ")
-	updateStatus(summary)
+--============================================================================--
+--// UI: Tab 1 — Auto-Drive
+--============================================================================--
+local AutoDriveBox = Tabs.AutoDrive:AddGroupbox({
+	Side = "Left",
+	Name = "Auto-Drive",
+	IconName = "navigation",
+	Description = "Sensor-guided autonomous driving using real A-Chassis inputs.",
+})
+
+AutoDriveBox:AddToggle("AutoDriveEnabled", {
+	Text = "Auto-Drive",
+	Default = false,
+	Tooltip = "Drives your seated car automatically while avoiding walls, cliffs, and other cars.",
+	Callback = function(Value)
+		if not Value then
+			releaseAllDrivingKeys()
+			StuckTimer = 0
+			ReverseUntil = 0
+			if Library.Labels.DriveStatus then
+				Library.Labels.DriveStatus:SetText("Status: idle")
+			end
+		else
+			refreshControlKeys()
+			if Toggles.CruiseEnabled and Toggles.CruiseEnabled.Value then
+				Toggles.CruiseEnabled:SetValue(false)
+			end
+		end
+	end,
+}):AddKeyPicker("AutoDriveKey", {
+	Default = "H",
+	Mode = "Toggle",
+	SyncToggleState = true,
+	Text = "Auto-Drive",
+})
+
+AutoDriveBox:AddDropdown("AutoDriveMode", {
+	Text = "Drive Mode",
+	Values = { "Free-Roam (Sensors)", "Saved Route Loop" },
+	Default = "Free-Roam (Sensors)",
+	Tooltip = "Free-Roam uses live rays; Saved Route Loop follows a recorded loop with obstacle avoidance.",
+})
+
+AutoDriveBox:AddSlider("TargetSpeed", {
+	Text = "Target Speed",
+	Default = 90,
+	Min = 30,
+	Max = 180,
+	Rounding = 0,
+	Suffix = " st/s",
+})
+
+AutoDriveBox:AddSlider("LookaheadMult", {
+	Text = "Sensor Lookahead",
+	Default = 1.0,
+	Min = 0.6,
+	Max = 2.0,
+	Rounding = 2,
+	Suffix = "x",
+})
+
+AutoDriveBox:AddSlider("SteerSensitivity", {
+	Text = "Steer Sensitivity",
+	Default = 1.0,
+	Min = 0.5,
+	Max = 1.8,
+	Rounding = 2,
+	Suffix = "x",
+})
+
+AutoDriveBox:AddToggle("StuckRecovery", {
+	Text = "Auto Stuck / Reverse Recovery",
+	Default = true,
+	Tooltip = "Reverses and counter-steers automatically if blocked for 2 seconds.",
+})
+
+AutoDriveBox:AddDivider()
+AutoDriveBox:AddLabel("DriveStatus", {
+	Text = "Status: idle",
+	DoesWrap = true,
+})
+
+-- Right side: Custom Route Recorder & Loop Player
+local RouteBox = Tabs.AutoDrive:AddGroupbox({
+	Side = "Right",
+	Name = "Custom Route Loop",
+	IconName = "route",
+	Description = "Record a clean highway/touge loop, then let Auto-Drive follow it forever.",
+})
+
+RouteBox:AddInput("RouteNameInput", {
+	Text = "Route Name",
+	Default = "ichikawa_loop",
+	Placeholder = "e.g. ichikawa_highway",
+	ClearTextOnFocus = false,
+})
+
+RouteBox:AddToggle("RecordRouteToggle", {
+	Text = "Record Waypoints",
+	Default = false,
+	Tooltip = "Drive a clean loop while enabled. Samples a point every 18 studs.",
+	Callback = function(Value)
+		RecordingRoute = Value
+		if Value then
+			RecordedPoints = {}
+			Library:Notify("Route recording started. Drive your loop, then turn off & Save.", 4)
+		else
+			Library:Notify(string.format("Recorded %d waypoints.", #RecordedPoints), 3)
+		end
+	end,
+})
+
+RouteBox:AddButton("Save Recorded Route", function()
+	local name = Options.RouteNameInput and Options.RouteNameInput.Value or ""
+	local ok, msg = saveRoute(name, RecordedPoints)
 	Library:Notify({
-		Title = "Scan Complete",
-		Description = summary,
-		Time = 5,
-	})
-end
-
---// Live Capture \\--
-local function logCapture(tag, msg)
-	if not IsCapturing then
-		return
-	end
-	local dt = os.clock() - CaptureStartTime
-	table.insert(CaptureEvents, string.format("[+%06.2fs] [%s] %s", dt, tag, msg))
-	if Library.Labels and Library.Labels.CaptureStatus then
-		Library.Labels.CaptureStatus:SetText(string.format("Capture: RECORDING (%d events)", #CaptureEvents))
-	end
-end
-
-local function stopRemoteHook()
-	if RemoteHookActive and OldNamecall and type(hookmetamethod) == "function" then
-		pcall(function()
-			hookmetamethod(game, "__namecall", OldNamecall)
-		end)
-	end
-	RemoteHookActive = false
-	OldNamecall = nil
-end
-
-local function startRemoteHook()
-	if RemoteHookActive then
-		return
-	end
-	if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
-		logCapture("WARN", "Remote hook unavailable (executor lacks hookmetamethod/getnamecallmethod)")
-		return
-	end
-	local ok = pcall(function()
-		OldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-			local method = getnamecallmethod()
-			if IsCapturing and not Unloaded and (method == "FireServer" or method == "InvokeServer") then
-				if typeof(self) == "Instance" and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction") or self:IsA("UnreliableRemoteEvent")) then
-					local args = { ... }
-					local argStrs = {}
-					for i = 1, math.min(#args, 6) do
-						argStrs[i] = fmtValue(args[i], 1)
-					end
-					if #args > 6 then
-						table.insert(argStrs, "...(" .. #args .. " args)")
-					end
-					logCapture("REMOTE", string.format("%s:%s(%s)", safeFullName(self), method, table.concat(argStrs, ", ")))
-				end
-			end
-			return OldNamecall(self, ...)
-		end)
-	end)
-	if ok and OldNamecall then
-		RemoteHookActive = true
-		logCapture("INFO", "Outgoing remote hook active")
-	end
-end
-
-local function stopLiveCapture(exportNow)
-	if not IsCapturing then
-		return
-	end
-	IsCapturing = false
-	disconnectAll(CaptureConnections)
-	stopRemoteHook()
-
-	if Library.Labels and Library.Labels.CaptureStatus then
-		Library.Labels.CaptureStatus:SetText(string.format("Capture: stopped (%d events)", #CaptureEvents))
-	end
-
-	if exportNow then
-		local lines = {}
-		scanHeaderAndPlayer(lines)
-		appendSection(lines, string.format("LIVE CAPTURE LOG (%d events)", #CaptureEvents))
-		for _, ev in ipairs(CaptureEvents) do
-			table.insert(lines, ev)
-		end
-		finalizeReport("mrt_live_capture", lines)
-	end
-end
-
-local function startLiveCapture()
-	if IsCapturing then
-		return
-	end
-	CaptureEvents = {}
-	CaptureStartTime = os.clock()
-	IsCapturing = true
-	logCapture("START", "Live capture started at pos " .. fmtVec3(getPlayerPos()))
-
-	-- Watch seat changes
-	local function bindChar(char)
-		if not char then return end
-		local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
-		if hum then
-			trackConn(CaptureConnections, hum:GetPropertyChangedSignal("SeatPart"):Connect(function()
-				local seat = hum.SeatPart
-				if seat then
-					local veh = getSeatedVehicle()
-					logCapture("SEAT", "Entered " .. safeFullName(seat) .. " | Vehicle=" .. safeFullName(veh))
-				else
-					logCapture("SEAT", "Exited seat at " .. fmtVec3(getPlayerPos()))
-				end
-			end))
-		end
-	end
-	bindChar(LocalPlayer.Character)
-	trackConn(CaptureConnections, LocalPlayer.CharacterAdded:Connect(bindChar))
-
-	-- Watch Workspace keyword objects added/removed (checkpoints, race markers, vehicles)
-	trackConn(CaptureConnections, Workspace.DescendantAdded:Connect(function(inst)
-		if matchesKeyword(inst.Name) or inst:IsA("ProximityPrompt") then
-			local pos = getInstPosition(inst)
-			logCapture("WS+", string.format("%s [%s] %s", safeFullName(inst), inst.ClassName, pos and fmtVec3(pos) or ""))
-		end
-	end))
-	trackConn(CaptureConnections, Workspace.DescendantRemoving:Connect(function(inst)
-		if matchesKeyword(inst.Name) or inst:IsA("ProximityPrompt") then
-			logCapture("WS-", string.format("%s [%s]", safeFullName(inst), inst.ClassName))
-		end
-	end))
-
-	-- Watch PlayerGui ScreenGui toggles
-	local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	if pgui then
-		local function watchGui(gui)
-			if not gui:IsA("ScreenGui") then return end
-			trackConn(CaptureConnections, gui:GetPropertyChangedSignal("Enabled"):Connect(function()
-				logCapture("GUI", string.format("%s Enabled=%s", gui.Name, tostring(gui.Enabled)))
-			end))
-		end
-		for _, g in ipairs(pgui:GetChildren()) do
-			watchGui(g)
-		end
-		trackConn(CaptureConnections, pgui.ChildAdded:Connect(function(g)
-			logCapture("GUI+", g.Name .. " [" .. g.ClassName .. "]")
-			watchGui(g)
-		end))
-	end
-
-	-- Watch LocalPlayer ValueBase & attribute changes (currency/XP/stats)
-	trackConn(CaptureConnections, LocalPlayer.AttributeChanged:Connect(function(attr)
-		logCapture("ATTR", attr .. " = " .. fmtValue(LocalPlayer:GetAttribute(attr), 1))
-	end))
-	local ls = LocalPlayer:FindFirstChild("leaderstats")
-	for _, desc in ipairs(LocalPlayer:GetDescendants()) do
-		if desc:IsA("ValueBase") and (not pgui or not desc:IsDescendantOf(pgui)) and (not ls or not desc:IsDescendantOf(ls)) then
-			trackConn(CaptureConnections, desc.Changed:Connect(function(newVal)
-				logCapture("STAT", safeFullName(desc) .. " = " .. fmtValue(newVal, 1))
-			end))
-		end
-	end
-	if ls then
-		for _, stat in ipairs(ls:GetChildren()) do
-			if stat:IsA("ValueBase") then
-				trackConn(CaptureConnections, stat.Changed:Connect(function(newVal)
-					logCapture("LEADERSTAT", stat.Name .. " = " .. fmtValue(newVal, 1))
-				end))
-			end
-		end
-	end
-
-	-- Optional outgoing remote hook
-	if Toggles.CaptureRemotes and Toggles.CaptureRemotes.Value then
-		startRemoteHook()
-	end
-
-	-- Optional position breadcrumbs while moving
-	task.spawn(function()
-		local lastPos = getPlayerPos()
-		while IsCapturing and not Unloaded do
-			task.wait(1.5)
-			if not IsCapturing or Unloaded then break end
-			if Toggles.CaptureBreadcrumbs and Toggles.CaptureBreadcrumbs.Value then
-				local pos = getPlayerPos()
-				if pos and (not lastPos or (pos - lastPos).Magnitude >= 25) then
-					local _, seat = getSeatedVehicle()
-					local speed = (seat and seat:IsA("BasePart")) and seat.AssemblyLinearVelocity.Magnitude or 0
-					logCapture("POS", string.format("%s | speed=%.1f", fmtVec3(pos), speed))
-					lastPos = pos
-				end
-			end
-		end
-	end)
-
-	Library:Notify({
-		Title = "Live Capture",
-		Description = "Recording started. Drive, start a race, hit checkpoints, then stop to export.",
+		Title = ok and "Route Saved" or "Save Failed",
+		Description = ok and ("Saved as " .. msg) or msg,
 		Time = 4,
 	})
-end
+	if ok and Options.SavedRouteDropdown then
+		Options.SavedRouteDropdown:SetValues(listSavedRoutes())
+		Options.SavedRouteDropdown:SetValue(msg)
+	end
+end)
 
---// UI: Scan Tab \\--
-local ScanBox = Tabs.Scan:AddGroupbox({
+RouteBox:AddDivider()
+
+RouteBox:AddDropdown("SavedRouteDropdown", {
+	Text = "Saved Routes",
+	Values = listSavedRoutes(),
+	Default = 1,
+})
+
+RouteBox:AddButton("Load Selected Route", function()
+	local sel = Options.SavedRouteDropdown and Options.SavedRouteDropdown.Value
+	local ok, msg = loadRoute(sel)
+	Library:Notify({
+		Title = ok and "Route Loaded" or "Load Failed",
+		Description = msg,
+		Time = 4,
+	})
+	if ok and Library.Labels.RouteStatus then
+		Library.Labels.RouteStatus:SetText("Route: " .. msg)
+	end
+end):AddButton("Refresh List", function()
+	if Options.SavedRouteDropdown then
+		Options.SavedRouteDropdown:SetValues(listSavedRoutes())
+	end
+end)
+
+RouteBox:AddLabel("RouteStatus", {
+	Text = "Route: none loaded",
+	DoesWrap = true,
+})
+
+--============================================================================--
+--// UI: Tab 2 — Assist (Collision Prevention, Cruise Control, Auto-Shift, QoL)
+--============================================================================--
+local ColBox = Tabs.Assist:AddGroupbox({
 	Side = "Left",
-	Name = "Game Data Scan",
+	Name = "Auto Collision Prevention",
+	IconName = "shield-alert",
+	Description = "Active driver assist while you drive manually.",
+})
+
+ColBox:AddToggle("CollisionPrevent", {
+	Text = "Collision Prevention",
+	Default = false,
+	Tooltip = "Automatically brakes and/or steers away when approaching a wall, cliff, or car.",
+	Callback = function(Value)
+		if not Value then
+			releaseAllDrivingKeys()
+			if Library.Labels.AssistStatus then
+				Library.Labels.AssistStatus:SetText("Assist: off")
+			end
+		else
+			refreshControlKeys()
+		end
+	end,
+}):AddKeyPicker("CollisionPreventKey", {
+	Default = "J",
+	Mode = "Toggle",
+	SyncToggleState = true,
+	Text = "Collision Prevention",
+})
+
+ColBox:AddDropdown("ColMode", {
+	Text = "Intervention Mode",
+	Values = { "Both (Brake + Steer)", "Brake Only", "Steer Only" },
+	Default = "Both (Brake + Steer)",
+})
+
+ColBox:AddSlider("ColTTC", {
+	Text = "Trigger Sensitivity (TTC)",
+	Default = 0.9,
+	Min = 0.3,
+	Max = 2.0,
+	Rounding = 2,
+	Suffix = " s",
+	Tooltip = "Higher = intervenes earlier before impact.",
+})
+
+ColBox:AddSlider("ColMinSpeed", {
+	Text = "Minimum Active Speed",
+	Default = 25,
+	Min = 10,
+	Max = 80,
+	Rounding = 0,
+	Suffix = " st/s",
+})
+
+ColBox:AddDivider()
+ColBox:AddLabel("AssistStatus", {
+	Text = "Assist: off",
+	DoesWrap = true,
+})
+
+local QoLBox = Tabs.Assist:AddGroupbox({
+	Side = "Right",
+	Name = "Driving QoL",
+	IconName = "gauge",
+})
+
+QoLBox:AddToggle("CruiseEnabled", {
+	Text = "Cruise Control",
+	Default = false,
+	Tooltip = "Holds your target speed smoothly while you steer (pauses when you brake).",
+	Callback = function(Value)
+		if not Value then
+			setKey(ControlKeys.Throttle, false)
+		elseif Toggles.AutoDriveEnabled and Toggles.AutoDriveEnabled.Value then
+			Toggles.AutoDriveEnabled:SetValue(false)
+		end
+	end,
+}):AddKeyPicker("CruiseKey", {
+	Default = "C",
+	Mode = "Toggle",
+	SyncToggleState = true,
+	Text = "Cruise Control",
+})
+
+QoLBox:AddSlider("CruiseSpeed", {
+	Text = "Cruise Speed",
+	Default = 90,
+	Min = 25,
+	Max = 200,
+	Rounding = 0,
+	Suffix = " st/s",
+})
+
+QoLBox:AddDivider("Transmission")
+
+QoLBox:AddToggle("AutoShift", {
+	Text = "Auto-Shift Assist (Manual/Semi)",
+	Default = false,
+	Tooltip = "Taps Shift Up/Down based on A-Chassis RPM when not in Auto mode.",
+})
+
+QoLBox:AddSlider("ShiftUpRPM", {
+	Text = "Shift Up RPM",
+	Default = 7200,
+	Min = 4000,
+	Max = 11000,
+	Rounding = 0,
+})
+
+QoLBox:AddSlider("ShiftDownRPM", {
+	Text = "Shift Down RPM",
+	Default = 3200,
+	Min = 1500,
+	Max = 6500,
+	Rounding = 0,
+})
+
+QoLBox:AddDivider("Actions")
+
+QoLBox:AddButton("Auto-Enter My Car", enterOwnCar):AddButton("Toggle Auto/Manual (M)", function()
+	tapKey(ControlKeys.ToggleTransMode, 0.05)
+end)
+
+--============================================================================--
+--// UI: Tab 3 — Events & Visuals
+--============================================================================--
+local EspBox = Tabs.Visuals:AddGroupbox({
+	Side = "Left",
+	Name = "ESP & Debug Visuals",
+	IconName = "eye",
+})
+
+EspBox:AddToggle("ShowSensorRays", {
+	Text = "3D Sensor Ray Visualizer",
+	Default = false,
+	Tooltip = "Shows Auto-Drive / Collision Prevention rays in 3D (green=clear, yellow=caution, red=hazard).",
+	Callback = function(Value)
+		if not Value then
+			clearDebugRays()
+		end
+	end,
+})
+
+EspBox:AddToggle("EventEsp", {
+	Text = "Race Event & Shop ESP",
+	Default = false,
+	Callback = function()
+		refreshEventEsp()
+	end,
+})
+
+EspBox:AddToggle("CarEsp", {
+	Text = "Other Players' Cars ESP",
+	Default = false,
+	Callback = function()
+		refreshCarEsp()
+	end,
+})
+
+EspBox:AddButton("Refresh ESP", function()
+	refreshEventEsp()
+	refreshCarEsp()
+	Library:Notify("ESP refreshed.", 2)
+end)
+
+local PerfBox = Tabs.Visuals:AddGroupbox({
+	Side = "Right",
+	Name = "Performance & Weather",
+	IconName = "zap",
+})
+
+PerfBox:AddToggle("FpsBoost", {
+	Text = "FPS Boost (No Shadows/Particles)",
+	Default = false,
+	Callback = function(Value)
+		setFpsBoost(Value)
+	end,
+})
+
+PerfBox:AddToggle("LowPower", {
+	Text = "Low Power Mode (Pause 3D Render)",
+	Default = false,
+	Tooltip = "Stops 3D rendering for overnight AFK Yen farming.",
+	Callback = function(Value)
+		setLowPower(Value)
+	end,
+}):AddKeyPicker("LowPowerKey", {
+	Default = "L",
+	Mode = "Toggle",
+	SyncToggleState = true,
+	Text = "Low Power",
+})
+
+PerfBox:AddSlider("LowPowerFpsCap", {
+	Text = "Low Power FPS Cap",
+	Default = 20,
+	Min = 10,
+	Max = 60,
+	Rounding = 0,
+	Suffix = " FPS",
+})
+
+PerfBox:AddButton("Toggle Client Rain", function()
+	local rem = ReplicatedStorage:FindFirstChild("RemoteEvents")
+	local toggleRain = rem and rem:FindFirstChild("ToggleRain")
+	if toggleRain and toggleRain:IsA("RemoteEvent") then
+		pcall(function() toggleRain:FireServer() end)
+		Library:Notify("Toggled rain.", 2)
+	else
+		Library:Notify("ToggleRain remote not found.", 3)
+	end
+end)
+
+--============================================================================--
+--// UI: Tab 4 — AFK & Alerts
+--============================================================================--
+local YenBox = Tabs.AFK:AddGroupbox({
+	Side = "Left",
+	Name = "AFK Yen Farm Stats",
+	IconName = "coins",
+})
+
+YenBox:AddLabel("YenStatsLabel", {
+	Text = "Yen: -- | Earned: +¥0\nRate: ¥0/hr | Runtime: 0m 0s",
+	DoesWrap = true,
+})
+
+YenBox:AddLabel("TelemetryLabel", {
+	Text = "Vehicle: not seated",
+	DoesWrap = true,
+})
+
+YenBox:AddButton("Reset Session Stats", function()
+	SessionStartTime = os.clock()
+	StartYen = getYenValue()
+	Library:Notify("Session stats reset.", 2)
+end)
+
+YenBox:AddDivider()
+
+YenBox:AddToggle("AntiAfk", {
+	Text = "Anti-AFK (Prevent 20m Kick)",
+	Default = true,
+})
+
+local AlertBox = Tabs.AFK:AddGroupbox({
+	Side = "Right",
+	Name = "Discord Webhook Alerts",
+	IconName = "bell",
+})
+
+AlertBox:AddInput("WebhookUrl", {
+	Text = "Discord Webhook URL",
+	Placeholder = "https://discord.com/api/webhooks/...",
+	ClearTextOnFocus = false,
+	Finished = false,
+})
+
+AlertBox:AddToggle("WebhookReports", {
+	Text = "Periodic Farm Summary",
+	Default = false,
+})
+
+AlertBox:AddSlider("WebhookInterval", {
+	Text = "Report Interval",
+	Default = 15,
+	Min = 5,
+	Max = 60,
+	Rounding = 0,
+	Suffix = " min",
+})
+
+AlertBox:AddButton("Send Test Report Now", function()
+	local url = Options.WebhookUrl and Options.WebhookUrl.Value or ""
+	local curYen = getYenValue() or 0
+	local earned = StartYen and (curYen - StartYen) or 0
+	local elapsed = math.max(os.clock() - SessionStartTime, 1)
+	local perHr = (earned / elapsed) * 3600
+	local msg = string.format(
+		"**MR:T Session Report** (%s)\nYen: ¥%s (+¥%s | ¥%s/hr)\nRuntime: %dm %ds",
+		LocalPlayer.Name,
+		formatNumber(curYen),
+		formatNumber(earned),
+		formatNumber(perHr),
+		math.floor(elapsed / 60),
+		math.floor(elapsed % 60)
+	)
+	local ok, res = sendWebhookText(url, msg)
+	Library:Notify({ Title = ok and "Webhook Sent" or "Webhook Failed", Description = res, Time = 4 })
+end)
+
+--============================================================================--
+--// UI: Tab 5 — Scanner (Kept for Future Map/Event Discovery)
+--============================================================================--
+local ScanBox = Tabs.Scanner:AddGroupbox({
+	Side = "Left",
+	Name = "Game Data Scanner",
 	IconName = "search",
-	Description = "Inspect Midnight Racing: Tokyo structure, vehicles, races, prompts & remotes.",
+	Description = "Inspect vehicle/map data for new MR:T regions or updates.",
 })
 
 ScanBox:AddSlider("ScanDepth", {
@@ -947,168 +1762,55 @@ ScanBox:AddSlider("ScanDepth", {
 	Min = 1,
 	Max = 6,
 	Rounding = 0,
-	Tooltip = "How deep to traverse Workspace/ReplicatedStorage/Vehicle trees.",
 })
 
-ScanBox:AddButton({
-	Text = "Run Full Game Scan",
-	Tooltip = "Scans player, vehicle, Workspace, prompts, triggers, remotes, ReplicatedStorage, UI, and tags.",
-	Func = function()
-		updateStatus("running full scan...")
-		task.spawn(function()
-			local depth = Options.ScanDepth and Options.ScanDepth.Value or 3
-			local lines = {}
-			scanHeaderAndPlayer(lines)
-			scanVehicle(lines, depth)
-			scanWorkspaceOverview(lines, depth)
-			scanPromptsAndTriggers(lines, nil)
-			scanRemotes(lines)
-			scanReplicatedStorage(lines, math.max(depth, 4))
-			scanPlayerGui(lines)
-			scanCollectionTags(lines)
-			finalizeReport("mrt_full_scan", lines)
-		end)
-	end,
+ScanBox:AddButton("Vehicle & Telemetry Snapshot", function()
+	task.spawn(function()
+		local lines = {}
+		scanHeaderAndPlayer(lines)
+		scanVehicle(lines, Options.ScanDepth and Options.ScanDepth.Value or 3)
+		finalizeReport("mrt_vehicle_snapshot", lines)
+	end)
+end)
+
+ScanBox:AddButton("Scan Events & Triggers", function()
+	task.spawn(function()
+		local lines = {}
+		scanHeaderAndPlayer(lines)
+		appendSection(lines, "PROXIMITY TRIGGERS & EVENTS")
+		for _, ev in ipairs(getEventsList()) do
+			table.insert(lines, string.format("- [%s] %s | %s (%.1f st)", ev.kind, ev.name, fmtVec3(ev.pos), ev.dist))
+		end
+		finalizeReport("mrt_events", lines)
+	end)
+end)
+
+ScanBox:AddToggle("AutoSendWebhook", {
+	Text = "Auto-Send Scans to Webhook",
+	Default = false,
 })
 
-ScanBox:AddButton({
-	Text = "Quick Vehicle & Race Snapshot",
-	Tooltip = "Fast snapshot of your current vehicle, nearby prompts/triggers (250 studs), and active UI.",
-	Func = function()
-		updateStatus("running vehicle/race snapshot...")
-		task.spawn(function()
-			local depth = Options.ScanDepth and Options.ScanDepth.Value or 3
-			local lines = {}
-			scanHeaderAndPlayer(lines)
-			scanVehicle(lines, math.max(depth, 4))
-			scanPromptsAndTriggers(lines, 250)
-			scanPlayerGui(lines)
-			finalizeReport("mrt_vehicle_snapshot", lines)
-		end)
-	end,
-})
-
-ScanBox:AddButton({
-	Text = "Scan Remotes Only",
-	Tooltip = "Dumps all RemoteEvents, RemoteFunctions, and Bindables across the game.",
-	Func = function()
-		updateStatus("scanning remotes...")
-		task.spawn(function()
-			local lines = {}
-			scanHeaderAndPlayer(lines)
-			scanRemotes(lines)
-			finalizeReport("mrt_remotes", lines)
-		end)
-	end,
-})
-
-ScanBox:AddDivider()
+ScanBox:AddButton("Copy Last Scan to Clipboard", function()
+	if LastReportText == "" then
+		Library:Notify("Run a scan first.", 3)
+		return
+	end
+	if type(setclipboard) ~= "function" then
+		Library:Notify("setclipboard unavailable.", 3)
+		return
+	end
+	setclipboard(LastReportText)
+	Library:Notify("Copied " .. LastReportName .. " to clipboard.", 3)
+end)
 
 ScanBox:AddLabel("ScanStatus", {
 	Text = "Status: idle",
 	DoesWrap = true,
 })
 
---// UI: Live Capture \\--
-local CaptureBox = Tabs.Scan:AddGroupbox({
-	Side = "Left",
-	Name = "Live Capture",
-	IconName = "radio",
-	Description = "Record seats, race checkpoints, GUI changes, stats, and optional remotes while playing.",
-})
-
-CaptureBox:AddToggle("LiveCaptureToggle", {
-	Text = "Live Capture Recording",
-	Default = false,
-	Tooltip = "Turn on, do actions in-game (enter car, start race, pass checkpoints), then turn off to export.",
-	Callback = function(Value)
-		if Value then
-			startLiveCapture()
-		else
-			stopLiveCapture(true)
-		end
-	end,
-})
-
-CaptureBox:AddToggle("CaptureBreadcrumbs", {
-	Text = "Record Position Breadcrumbs",
-	Default = true,
-	Tooltip = "Logs your coordinates & speed every ~25 studs moved.",
-})
-
-CaptureBox:AddToggle("CaptureRemotes", {
-	Text = "Capture Outgoing Remotes (Hook)",
-	Default = false,
-	Risky = true,
-	Tooltip = "Hooks FireServer/InvokeServer during Live Capture (requires hookmetamethod).",
-})
-
-CaptureBox:AddLabel("CaptureStatus", {
-	Text = "Capture: idle",
-	DoesWrap = true,
-})
-
---// UI: Export & Webhook \\--
-local ExportBox = Tabs.Scan:AddGroupbox({
-	Side = "Right",
-	Name = "Export & Webhook",
-	IconName = "send",
-	Description = "Save locally, copy to clipboard, or upload scan .txt files to Discord.",
-})
-
-ExportBox:AddInput("WebhookUrl", {
-	Text = "Discord Webhook URL",
-	Placeholder = "https://discord.com/api/webhooks/...",
-	ClearTextOnFocus = false,
-	Finished = false,
-})
-
-ExportBox:AddToggle("AutoSendWebhook", {
-	Text = "Auto-Send Scans to Webhook",
-	Default = false,
-	Tooltip = "Automatically uploads each completed scan/capture .txt to the webhook above.",
-})
-
-ExportBox:AddButton({
-	Text = "Send Last Scan to Webhook",
-	Func = function()
-		if LastReportText == "" then
-			Library:Notify("Run a scan first.", 3)
-			return
-		end
-		local url = Options.WebhookUrl and Options.WebhookUrl.Value or ""
-		local ok, msg = sendReportToWebhook(url, LastReportName, LastReportText)
-		Library:Notify({
-			Title = ok and "Webhook Sent" or "Webhook Failed",
-			Description = msg,
-			Time = 4,
-		})
-	end,
-})
-
-ExportBox:AddButton({
-	Text = "Copy Last Scan to Clipboard",
-	Func = function()
-		if LastReportText == "" then
-			Library:Notify("Run a scan first.", 3)
-			return
-		end
-		if type(setclipboard) ~= "function" then
-			Library:Notify("setclipboard is not available on this executor.", 3)
-			return
-		end
-		setclipboard(LastReportText)
-		Library:Notify(string.format("Copied %s (%.1f KB) to clipboard.", LastReportName, #LastReportText / 1024), 4)
-	end,
-})
-
-ExportBox:AddDivider()
-ExportBox:AddLabel(
-	"Scans are automatically saved to AllainHub/scans/ in your executor workspace folder when writefile is available.",
-	true
-)
-
---// UI: Settings Tab \\--
+--============================================================================--
+--// UI: Tab 6 — Settings
+--============================================================================--
 local MenuGroup = Tabs.Settings:AddGroupbox({
 	Side = "Left",
 	Name = "Menu",
@@ -1146,21 +1848,202 @@ Library.ToggleKeybind = Options.MenuKeybind
 
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
-
 SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({ "MenuKeybind", "LiveCaptureToggle" })
-
+SaveManager:SetIgnoreIndexes({ "MenuKeybind", "AutoDriveEnabled", "RecordRouteToggle", "LowPower" })
 ThemeManager:SetFolder("AllainHub")
 SaveManager:SetFolder("AllainHub/midnight-racing-tokyo")
-
 SaveManager:BuildConfigSection(Tabs.Settings)
 ThemeManager:ApplyToTab(Tabs.Settings)
 SaveManager:LoadAutoloadConfig()
 
+--============================================================================--
+--// Main Loops (Heartbeat Driving + 1s UI/ESP/AFK Updater)
+--============================================================================--
+StartYen = getYenValue()
+
+-- Anti-AFK listener
+trackConn(Connections, LocalPlayer.Idled:Connect(function()
+	if Unloaded then return end
+	if Toggles.AntiAfk and Toggles.AntiAfk.Value then
+		if VirtualUser then
+			pcall(function()
+				VirtualUser:CaptureController()
+				VirtualUser:ClickButton2(Vector2.new())
+			end)
+		end
+	end
+end))
+
+-- Main driving / sensor loop
+trackConn(Connections, RunService.Heartbeat:Connect(function(dt)
+	if Unloaded then return end
+
+	local veh, seat = getSeatedVehicle()
+	local autoDrive = Toggles.AutoDriveEnabled and Toggles.AutoDriveEnabled.Value
+	local colPrevent = Toggles.CollisionPrevent and Toggles.CollisionPrevent.Value
+	local cruise = Toggles.CruiseEnabled and Toggles.CruiseEnabled.Value
+	local showRays = Toggles.ShowSensorRays and Toggles.ShowSensorRays.Value
+	local autoShift = Toggles.AutoShift and Toggles.AutoShift.Value
+
+	if not veh or not seat then
+		if autoDrive or colPrevent or cruise then
+			releaseAllDrivingKeys()
+		end
+		if #ActiveRayVisuals > 0 then
+			clearDebugRays()
+		end
+		return
+	end
+
+	local kin = getVehicleKinematics(veh, seat)
+	if not kin then return end
+
+	-- Route recording
+	if RecordingRoute then
+		local last = RecordedPoints[#RecordedPoints]
+		local needSample = not last
+			or ((kin.pos.X - last.x) ^ 2 + (kin.pos.Z - last.z) ^ 2) >= (18 * 18)
+		if needSample then
+			table.insert(RecordedPoints, {
+				x = math.floor(kin.pos.X * 10) / 10,
+				y = math.floor(kin.pos.Y * 10) / 10,
+				z = math.floor(kin.pos.Z * 10) / 10,
+				speed = math.floor(math.max(kin.forwardSpeed, 20)),
+			})
+			if Library.Labels.RouteStatus then
+				Library.Labels.RouteStatus:SetText(string.format("Recording: %d waypoints", #RecordedPoints))
+			end
+		end
+	end
+
+	-- Priority: Auto-Drive > Collision Prevention > Cruise Control
+	if autoDrive then
+		stepAutoDrive(veh, kin, dt)
+	elseif colPrevent then
+		local intervened = stepCollisionPrevention(veh, kin, dt)
+		if not intervened and cruise then
+			stepCruiseControl(kin, dt)
+		end
+	elseif cruise then
+		if showRays then
+			scanSensors(veh, kin, Options.LookaheadMult and Options.LookaheadMult.Value or 1.0)
+		end
+		stepCruiseControl(kin, dt)
+	elseif showRays then
+		scanSensors(veh, kin, Options.LookaheadMult and Options.LookaheadMult.Value or 1.0)
+	end
+
+	if autoShift then
+		stepAutoShift()
+	end
+end))
+
+-- 1-second stats, ESP distance, and webhook timer loop
+task.spawn(function()
+	while not Unloaded do
+		task.wait(1)
+		if Unloaded then break end
+
+		-- Yen & Telemetry HUD
+		local curYen = getYenValue()
+		if curYen then
+			if not StartYen then StartYen = curYen end
+			LastYen = curYen
+			local earned = curYen - StartYen
+			local elapsed = math.max(os.clock() - SessionStartTime, 1)
+			local perHr = (earned / elapsed) * 3600
+			if Library.Labels.YenStatsLabel then
+				Library.Labels.YenStatsLabel:SetText(string.format(
+					"Yen: ¥%s | Earned: +¥%s\nRate: ¥%s/hr | Runtime: %dm %ds",
+					formatNumber(curYen),
+					formatNumber(earned),
+					formatNumber(perHr),
+					math.floor(elapsed / 60),
+					math.floor(elapsed % 60)
+				))
+			end
+
+			-- Periodic webhook summary
+			if Toggles.WebhookReports and Toggles.WebhookReports.Value then
+				local interval = (Options.WebhookInterval and Options.WebhookInterval.Value or 15) * 60
+				if os.clock() - LastWebhookReportTime >= interval then
+					LastWebhookReportTime = os.clock()
+					local url = Options.WebhookUrl and Options.WebhookUrl.Value or ""
+					if url ~= "" then
+						sendWebhookText(url, string.format(
+							"**MR:T Auto-Report** (%s) | Yen: ¥%s (+¥%s | ¥%s/hr) | %dm",
+							LocalPlayer.Name,
+							formatNumber(curYen),
+							formatNumber(earned),
+							formatNumber(perHr),
+							math.floor(elapsed / 60)
+						))
+					end
+				end
+			end
+		end
+
+		-- Vehicle telemetry readout
+		local veh, seat = getSeatedVehicle()
+		if Library.Labels.TelemetryLabel then
+			if veh and seat then
+				local speed = seat.AssemblyLinearVelocity.Magnitude
+				local tele = getAChassisTelemetry()
+				local gearStr = tele and tele.gear and tostring(tele.gear) or "?"
+				local rpmStr = tele and tele.rpm and tostring(math.floor(tele.rpm)) or "?"
+				Library.Labels.TelemetryLabel:SetText(string.format(
+					"Vehicle: %s | %.0f st/s | Gear %s | %s RPM",
+					veh.Name,
+					speed,
+					gearStr,
+					rpmStr
+				))
+			else
+				Library.Labels.TelemetryLabel:SetText("Vehicle: not seated")
+			end
+		end
+
+		-- Update ESP distance labels
+		local pPos = getPlayerPos()
+		if pPos then
+			for _, bb in ipairs(EventEspObjects) do
+				if bb and bb.Parent and bb.Adornee and bb.Adornee:IsA("BasePart") then
+					local lbl = bb:FindFirstChildOfClass("TextLabel")
+					if lbl then
+						local d = (bb.Adornee.Position - pPos).Magnitude
+						lbl.Text = string.format("%s (%.0f st)", bb:GetAttribute("BaseName") or "", d)
+					end
+				end
+			end
+			for _, bb in ipairs(CarEspObjects) do
+				if bb and bb.Parent and bb.Adornee and bb.Adornee:IsA("BasePart") then
+					local lbl = bb:FindFirstChildOfClass("TextLabel")
+					if lbl then
+						local d = (bb.Adornee.Position - pPos).Magnitude
+						local spd = bb.Adornee.AssemblyLinearVelocity.Magnitude
+						lbl.Text = string.format("%s (%.0f st | %.0f st/s)", bb:GetAttribute("BaseName") or "", d, spd)
+					end
+				end
+			end
+		end
+	end
+end)
+
+--// Unload Cleanup \\--
 Library:OnUnload(function()
 	Unloaded = true
-	stopLiveCapture(false)
+	releaseAllDrivingKeys()
+	clearDebugRays()
+	clearEspTable(EventEspObjects)
+	clearEspTable(CarEspObjects)
+	if LowPowerActive then
+		setLowPower(false)
+	end
+	if SavedLighting then
+		setFpsBoost(false)
+	end
 	disconnectAll(Connections)
+	disconnectAll(CaptureConnections)
 	if env.__AllainMRTLibrary == Library then
 		env.__AllainMRTLibrary = nil
 	end
@@ -1168,6 +2051,6 @@ end)
 
 Library:Notify({
 	Title = "Allain Automation",
-	Description = "Midnight Racing: Tokyo scanner loaded. Press RightShift to toggle menu.",
+	Description = "Midnight Racing: Tokyo v0.2 loaded! Press RightShift to toggle menu.",
 	Time = 4,
 })
