@@ -48,8 +48,8 @@ local GAMES = {
 		name = "Midnight Racing: Tokyo",
 		file = "games/midnight-racing-tokyo.lua",
 		gameIds = { 1198533421 },
-		placeIds = { 7444724537 },
-		nameMatches = { "midnight racing" },
+		placeIds = { 7444724537, 5025250023 },
+		nameMatches = { "midnight racing", "mr:t" },
 	},
 }
 

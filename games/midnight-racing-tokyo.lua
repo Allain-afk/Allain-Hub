@@ -73,7 +73,7 @@ local Window = Library:CreateWindow({
 	Title = "Allain Automation",
 	Footer = "Midnight Racing: Tokyo",
 	FooterLeft = "MR:T Automation",
-	FooterRight = "v0.2",
+	FooterRight = "v0.3",
 	Username = true,
 	Badge = "Beta",
 	NotifySide = "Right",
@@ -267,18 +267,19 @@ local function releaseAllDrivingKeys()
 end
 
 -- Smooth PWM application: converts analog throttle [0..1], brake [0..1], steer [-1..1]
--- into clean key holds/pulses so A-Chassis steers smoothly without harsh snapping.
+-- into responsive A-Chassis key holds/pulses. A-Chassis already smooths steering internally,
+-- so holding the key solidly above 0.52 gives crisp turns without ReturnSpeed fighting us.
 local function applyDrivingInputs(throttle, brake, steer, dt)
-	PwmPhase = (PwmPhase + dt * 10) % 1 -- 10 Hz PWM cycle
+	PwmPhase = (PwmPhase + dt * 6) % 1 -- 6 Hz PWM cycle (long enough pulses for A-Chassis)
 
 	-- Throttle & Brake (mutually exclusive)
-	if brake > 0.05 then
+	if brake > 0.08 then
 		setKey(ControlKeys.Throttle, false)
-		local brakeOn = brake >= 0.85 or (PwmPhase < brake)
+		local brakeOn = brake >= 0.55 or (PwmPhase < brake)
 		setKey(ControlKeys.Brake, brakeOn)
-	elseif throttle > 0.05 then
+	elseif throttle > 0.08 then
 		setKey(ControlKeys.Brake, false)
-		local throttleOn = throttle >= 0.85 or (PwmPhase < throttle)
+		local throttleOn = throttle >= 0.72 or (PwmPhase < throttle)
 		setKey(ControlKeys.Throttle, throttleOn)
 	else
 		setKey(ControlKeys.Throttle, false)
@@ -287,17 +288,20 @@ local function applyDrivingInputs(throttle, brake, steer, dt)
 
 	-- Steering: negative = left, positive = right
 	local absSteer = math.abs(steer)
-	if absSteer < 0.07 then
+	if absSteer < 0.08 then
 		setKey(ControlKeys.SteerLeft, false)
 		setKey(ControlKeys.SteerRight, false)
-	elseif steer < 0 then
-		setKey(ControlKeys.SteerRight, false)
-		local leftOn = absSteer >= 0.82 or (PwmPhase < absSteer)
-		setKey(ControlKeys.SteerLeft, leftOn)
 	else
-		setKey(ControlKeys.SteerLeft, false)
-		local rightOn = absSteer >= 0.82 or (PwmPhase < absSteer)
-		setKey(ControlKeys.SteerRight, rightOn)
+		-- Non-linear boost so moderate corridor angles turn A-Chassis decisively
+		local duty = math.clamp(absSteer ^ 0.72, 0.22, 1.0)
+		local steerOn = absSteer >= 0.52 or (PwmPhase < duty)
+		if steer < 0 then
+			setKey(ControlKeys.SteerRight, false)
+			setKey(ControlKeys.SteerLeft, steerOn)
+		else
+			setKey(ControlKeys.SteerLeft, false)
+			setKey(ControlKeys.SteerRight, steerOn)
+		end
 	end
 end
 
@@ -343,36 +347,55 @@ local function getVehicleKinematics(veh, seat)
 		return nil
 	end
 	local cf = seat.CFrame
-	local forward = cf.LookVector
-	local flatForward = Vector3.new(forward.X, 0, forward.Z)
+	local look = cf.LookVector
+	local up = cf.UpVector
+	if up.Y < 0.3 then
+		up = Vector3.new(0, 1, 0)
+	end
+
+	-- Pitch-aligned forward vector (clamped so suspension bumps don't shoot rays into sky/ground)
+	local pitchY = math.clamp(look.Y, -0.32, 0.32)
+	local flatForward = Vector3.new(look.X, 0, look.Z)
 	if flatForward.Magnitude < 0.01 then
 		flatForward = Vector3.new(0, 0, -1)
 	else
 		flatForward = flatForward.Unit
 	end
-	local flatRight = Vector3.new(-flatForward.Z, 0, flatForward.X)
+	local forward = Vector3.new(flatForward.X, pitchY, flatForward.Z).Unit
+	local right = Vector3.new(-flatForward.Z, 0, flatForward.X)
 
 	local vel = seat.AssemblyLinearVelocity
 	local flatVel = Vector3.new(vel.X, 0, vel.Z)
 	local forwardSpeed = flatVel:Dot(flatForward)
 	local totalSpeed = flatVel.Magnitude
+	local velDir = totalSpeed > 8 and Vector3.new(flatVel.Unit.X, pitchY, flatVel.Unit.Z).Unit or forward
 
-	-- Estimate front bumper origin from vehicle bounding box
-	local frontOffset = 7.5
+	-- Estimate front bumper offset from vehicle bounding box
+	local frontOffset = 8.0
 	local okBox, boxCF, boxSize = pcall(function()
 		return veh:GetBoundingBox()
 	end)
 	if okBox and typeof(boxCF) == "CFrame" and typeof(boxSize) == "Vector3" then
 		local halfLen = math.max(boxSize.Z, boxSize.X) * 0.5
-		frontOffset = math.clamp(halfLen, 5, 13)
+		frontOffset = math.clamp(halfLen, 5.5, 14)
 	end
 
-	local sensorOrigin = seat.Position + flatForward * (frontOffset * 0.65) + Vector3.new(0, 1.4, 0)
+	-- Two sensor heights relative to DriveSeat:
+	-- bumperOrigin catches low guardrails, curbs, median barriers, low sports cars
+	-- hoodOrigin catches walls, trucks, pillars, trees
+	local bumperOrigin = seat.Position + forward * (frontOffset * 0.72) - up * 0.55
+	local hoodOrigin = seat.Position + forward * (frontOffset * 0.65) + up * 0.85
+
 	return {
 		pos = seat.Position,
-		sensorOrigin = sensorOrigin,
-		forward = flatForward,
-		right = flatRight,
+		bumperOrigin = bumperOrigin,
+		hoodOrigin = hoodOrigin,
+		sensorOrigin = hoodOrigin,
+		forward = forward,
+		flatForward = flatForward,
+		right = right,
+		up = up,
+		velDir = velDir,
 		forwardSpeed = forwardSpeed,
 		totalSpeed = totalSpeed,
 		frontOffset = frontOffset,
@@ -433,9 +456,13 @@ local function formatNumber(n)
 end
 
 --============================================================================--
---// 3D Sensor Raycast Engine & Debug Visualizer
+--// 3D Sensor Raycast Engine (11-Ray Dense Fan + Spherecast + Slope Filter)
 --============================================================================--
-local WHISKER_ANGLES = { -65, -35, -15, 0, 15, 35, 65 }
+local WHISKER_ANGLES = { -75, -55, -38, -24, -12, 0, 12, 24, 38, 55, 75 }
+local CENTER_RAY_IDX = 6
+local HAS_SPHERECAST = pcall(function()
+	return type(Workspace.Spherecast) == "function"
+end)
 
 local function clearDebugRays()
 	for i = #ActiveRayVisuals, 1, -1 do
@@ -485,7 +512,7 @@ local function setDebugRayPart(index, origin, targetPos, color)
 	end
 	part.Transparency = 0.35
 	part.Color = color
-	part.Size = Vector3.new(0.18, 0.18, dist)
+	part.Size = Vector3.new(0.22, 0.22, dist)
 	part.CFrame = CFrame.lookAt(origin + diff * 0.5, targetPos)
 end
 
@@ -523,10 +550,43 @@ local function isOtherPlayerVehicle(inst)
 	return true
 end
 
+-- Casts a thick Spherecast (fallback to Raycast) that skips non-collidable triggers
+-- AND ignores drivable upward-facing road/ramp surfaces (Normal.Y > 0.62).
+local function castObstacleRay(origin, dir, maxDist, params, useSphere)
+	local traveled = 0
+	local curOrigin = origin
+	for _ = 1, 3 do
+		local remaining = maxDist - traveled
+		if remaining <= 1 then
+			return maxDist, nil
+		end
+		local res
+		if useSphere and HAS_SPHERECAST then
+			res = Workspace:Spherecast(curOrigin, 1.05, dir * remaining, params)
+		else
+			res = Workspace:Raycast(curOrigin, dir * remaining, params)
+		end
+		if not res or not res.Instance then
+			return maxDist, nil
+		end
+		local hit = res.Instance
+		local isWall = hit.CanCollide and (res.Normal.Y < 0.62)
+		if isWall then
+			return traveled + res.Distance, hit
+		end
+		-- Pass through non-collidable trigger or drivable road/ramp slope
+		local step = res.Distance + 2.5
+		traveled = traveled + step
+		curOrigin = curOrigin + dir * step
+	end
+	return maxDist, nil
+end
+
 local function scanSensors(veh, kin, lookaheadMult)
 	lookaheadMult = lookaheadMult or 1.0
 	local speed = math.max(kin.forwardSpeed, 0)
-	local centerRange = math.clamp((32 + speed * 0.65) * lookaheadMult, 26, 175)
+	-- True long-range lookahead: 2.2+ seconds ahead so car sees corners & walls early
+	local centerRange = math.clamp((65 + speed * 2.25) * lookaheadMult, 65, 360)
 	local params = buildRaycastParams(veh)
 	local showDebug = Toggles.ShowSensorRays and Toggles.ShowSensorRays.Value
 	local vf = Workspace:FindFirstChild("VehiclesFolder")
@@ -538,33 +598,33 @@ local function scanSensors(veh, kin, lookaheadMult)
 	for idx, deg in ipairs(WHISKER_ANGLES) do
 		local rad = math.rad(deg)
 		local dir = (kin.forward * math.cos(rad) + kin.right * math.sin(rad)).Unit
-		-- Side rays are shorter than forward rays
-		local scale = (deg == 0) and 1.0 or (math.abs(deg) <= 15 and 0.88 or (math.abs(deg) <= 35 and 0.65 or 0.42))
+		local absDeg = math.abs(deg)
+		local scale = (absDeg == 0) and 1.0
+			or (absDeg <= 12 and 0.95
+			or (absDeg <= 24 and 0.85
+			or (absDeg <= 38 and 0.70
+			or (absDeg <= 55 and 0.50 or 0.35))))
 		local maxDist = centerRange * scale
 
-		local res = Workspace:Raycast(kin.sensorOrigin, dir * maxDist, params)
-		local dist = maxDist
-		local hitCar = false
-		if res and res.Instance and res.Instance.CanCollide then
-			dist = res.Distance
-			if vf and isOtherPlayerVehicle(res.Instance) then
-				hitCar = true
-			end
-		elseif res and res.Instance and not res.Instance.CanCollide then
-			-- Re-cast past non-collidable trigger/decoration if needed
-			local res2 = Workspace:Raycast(res.Position + dir * 1.5, dir * math.max(maxDist - res.Distance - 1.5, 1), params)
-			if res2 and res2.Instance and res2.Instance.CanCollide then
-				dist = res.Distance + 1.5 + res2.Distance
-				if vf and isOtherPlayerVehicle(res2.Instance) then
-					hitCar = true
-				end
+		-- Forward cone casts at BOTH bumper height (guardrails/curbs) and hood height (walls/cars)
+		local useSphere = absDeg <= 24
+		local distHood, hitHood = castObstacleRay(kin.hoodOrigin, dir, maxDist, params, useSphere)
+		local dist = distHood
+		local hitInst = hitHood
+
+		if absDeg <= 38 then
+			local distBumper, hitBumper = castObstacleRay(kin.bumperOrigin, dir, maxDist, params, false)
+			if distBumper < dist then
+				dist = distBumper
+				hitInst = hitBumper
 			end
 		end
 
+		local hitCar = (hitInst ~= nil) and (vf ~= nil) and isOtherPlayerVehicle(hitInst)
 		local ratio = dist / maxDist
 		rays[idx] = { deg = deg, dist = dist, maxDist = maxDist, ratio = ratio, hitCar = hitCar }
 
-		if math.abs(deg) <= 15 and dist < minForwardDist then
+		if absDeg <= 12 and dist < minForwardDist then
 			minForwardDist = dist
 			if hitCar then
 				hitOtherCarAhead = true
@@ -573,27 +633,39 @@ local function scanSensors(veh, kin, lookaheadMult)
 
 		if showDebug then
 			local col = ratio > 0.65 and Color3.fromRGB(60, 230, 110)
-				or (ratio > 0.35 and Color3.fromRGB(245, 200, 60) or Color3.fromRGB(240, 70, 70))
-			setDebugRayPart(idx, kin.sensorOrigin, kin.sensorOrigin + dir * dist, col)
+				or (ratio > 0.32 and Color3.fromRGB(245, 200, 60) or Color3.fromRGB(240, 70, 70))
+			setDebugRayPart(idx, kin.bumperOrigin, kin.bumperOrigin + dir * dist, col)
 		end
 	end
 
+	-- Velocity-vector ray: catches slides/drifts toward outer walls even when nose is turned
+	local velDist, velHit = castObstacleRay(kin.bumperOrigin, kin.velDir, centerRange * 0.95, params, true)
+	if velDist < minForwardDist then
+		minForwardDist = velDist
+		if velHit and vf and isOtherPlayerVehicle(velHit) then
+			hitOtherCarAhead = true
+		end
+	end
+	if showDebug then
+		setDebugRayPart(12, kin.hoodOrigin, kin.hoodOrigin + kin.velDir * velDist, Color3.fromRGB(255, 110, 240))
+	end
+
 	-- Downward road-edge / cliff probes (ahead-left and ahead-right)
-	local edgeAhead = math.clamp(16 + speed * 0.28, 16, 48)
-	local edgeSpread = 10
-	local leftOrigin = kin.pos + kin.forward * edgeAhead - kin.right * edgeSpread + Vector3.new(0, 4, 0)
-	local rightOrigin = kin.pos + kin.forward * edgeAhead + kin.right * edgeSpread + Vector3.new(0, 4, 0)
-	local downVec = Vector3.new(0, -18, 0)
+	local edgeAhead = math.clamp(22 + speed * 0.45, 22, 80)
+	local edgeSpread = 12
+	local leftOrigin = kin.pos + kin.flatForward * edgeAhead - kin.right * edgeSpread + Vector3.new(0, 6, 0)
+	local rightOrigin = kin.pos + kin.flatForward * edgeAhead + kin.right * edgeSpread + Vector3.new(0, 6, 0)
+	local downVec = Vector3.new(0, -24, 0)
 
 	local leftGround = Workspace:Raycast(leftOrigin, downVec, params)
 	local rightGround = Workspace:Raycast(rightOrigin, downVec, params)
-	local leftCliff = (not leftGround) or (leftGround.Distance > 9.5)
-	local rightCliff = (not rightGround) or (rightGround.Distance > 9.5)
+	local leftCliff = (not leftGround) or (leftGround.Distance > 13)
+	local rightCliff = (not rightGround) or (rightGround.Distance > 13)
 
 	if showDebug then
-		setDebugRayPart(8, leftOrigin, leftGround and leftGround.Position or (leftOrigin + downVec),
+		setDebugRayPart(13, leftOrigin, leftGround and leftGround.Position or (leftOrigin + downVec),
 			leftCliff and Color3.fromRGB(240, 70, 70) or Color3.fromRGB(80, 180, 255))
-		setDebugRayPart(9, rightOrigin, rightGround and rightGround.Position or (rightOrigin + downVec),
+		setDebugRayPart(14, rightOrigin, rightGround and rightGround.Position or (rightOrigin + downVec),
 			rightCliff and Color3.fromRGB(240, 70, 70) or Color3.fromRGB(80, 180, 255))
 	else
 		if #ActiveRayVisuals > 0 then
@@ -603,8 +675,9 @@ local function scanSensors(veh, kin, lookaheadMult)
 
 	return {
 		rays = rays,
-		centerDist = rays[4].dist,
-		centerRatio = rays[4].ratio,
+		centerDist = rays[CENTER_RAY_IDX].dist,
+		centerRatio = rays[CENTER_RAY_IDX].ratio,
+		velDist = velDist,
 		minForwardDist = minForwardDist,
 		hitOtherCarAhead = hitOtherCarAhead,
 		leftCliff = leftCliff,
@@ -695,34 +768,79 @@ local function findNearestRouteIndex(pos, points)
 end
 
 --============================================================================--
---// Driving Controllers (Auto-Drive, Collision Prevention, Cruise, Auto-Shift)
+--// Driving Controllers (Follow-The-Gap + Physics Braking + Collision Assist)
 --============================================================================--
 local function computeObstacleAvoidance(sensors)
 	local r = sensors.rays
-	-- Left clearance: rays 1 (-65), 2 (-35), 3 (-15)
-	-- Right clearance: rays 5 (+15), 6 (+35), 7 (+65)
-	local leftScore = r[1].ratio * 0.22 + r[2].ratio * 0.36 + r[3].ratio * 0.42
-	local rightScore = r[7].ratio * 0.22 + r[6].ratio * 0.36 + r[5].ratio * 0.42
+	local n = #r
 
-	if sensors.leftCliff then leftScore = leftScore - 0.45 end
-	if sensors.rightCliff then rightScore = rightScore - 0.45 end
+	-- 1. Follow-The-Gap: score each ray by its 3-ray corridor width (prevents aiming at narrow gaps)
+	local bestAngle = 0
+	local bestScore = -math.huge
+	local leftTotal, rightTotal = 0, 0
 
-	-- Positive steer = turn right (away from left obstacles)
-	local steer = (rightScore - leftScore) * 1.45
+	for i = 1, n do
+		local prevD = r[math.max(1, i - 1)].dist
+		local curD = r[i].dist
+		local nextD = r[math.min(n, i + 1)].dist
+		-- Corridor clearance is limited by the tightest neighbor
+		local corridorDist = curD * 0.50 + math.min(prevD, curD) * 0.25 + math.min(nextD, curD) * 0.25
+		local deg = r[i].deg
 
-	-- If dead ahead is blocked, bias firmly toward the more open side
-	if sensors.centerRatio < 0.55 then
-		local urgency = (0.55 - sensors.centerRatio) / 0.55
-		local dir = (rightScore >= leftScore) and 1 or -1
-		steer = steer + dir * urgency * 0.95
+		-- Gentle forward preference so on straight roads the car doesn't dart into side exits
+		local forwardBias = 1.0 - (math.abs(deg) / 145)
+		local score = corridorDist * forwardBias
+
+		if deg < 0 then
+			leftTotal = leftTotal + curD
+			if sensors.leftCliff then score = score * 0.35 end
+		elseif deg > 0 then
+			rightTotal = rightTotal + curD
+			if sensors.rightCliff then score = score * 0.35 end
+		end
+
+		if r[i].hitCar then
+			score = score * 0.45
+		end
+
+		if score > bestScore then
+			bestScore = score
+			bestAngle = deg
+		end
 	end
 
-	return math.clamp(steer, -1, 1), leftScore, rightScore
+	-- Convert best open corridor angle into decisive steering [-1..1]
+	local steer = math.clamp(bestAngle / 34, -1, 1)
+
+	-- 2. Side wall-repulsion: push away if a guardrail/curb is hugging either side (< 18 studs)
+	local closeLeft = math.min(r[1].dist, r[2].dist, r[3].dist)
+	local closeRight = math.min(r[n].dist, r[n - 1].dist, r[n - 2].dist)
+	if closeLeft < 18 then
+		steer = steer + ((18 - closeLeft) / 18) * 0.70
+	end
+	if closeRight < 18 then
+		steer = steer - ((18 - closeRight) / 18) * 0.70
+	end
+
+	-- 3. Cliff repulsion
+	if sensors.leftCliff and not sensors.rightCliff then
+		steer = steer + 0.55
+	elseif sensors.rightCliff and not sensors.leftCliff then
+		steer = steer - 0.55
+	end
+
+	return math.clamp(steer, -1, 1), leftTotal, rightTotal, bestAngle
+end
+
+local function computeStoppingDistance(speed)
+	local s = math.max(speed, 0)
+	-- Conservative A-Chassis braking curve: d = v^2 / (2*a) + safety buffer (a ≈ 40 st/s^2)
+	return (s * s) / 80 + 18
 end
 
 local function stepAutoDrive(veh, kin, dt)
 	local mode = Options.AutoDriveMode and Options.AutoDriveMode.Value or "Free-Roam (Sensors)"
-	local targetSpeed = Options.TargetSpeed and Options.TargetSpeed.Value or 95
+	local targetSpeed = Options.TargetSpeed and Options.TargetSpeed.Value or 90
 	local lookaheadMult = Options.LookaheadMult and Options.LookaheadMult.Value or 1.0
 	local steerSens = Options.SteerSensitivity and Options.SteerSensitivity.Value or 1.0
 	local stuckEnabled = Toggles.StuckRecovery and Toggles.StuckRecovery.Value
@@ -732,31 +850,29 @@ local function stepAutoDrive(veh, kin, dt)
 
 	-- Stuck / Reverse recovery
 	if now < ReverseUntil then
-		applyDrivingInputs(0, 0.95, ReverseSteerDir * 0.9, dt)
+		applyDrivingInputs(0, 1.0, ReverseSteerDir, dt)
 		if Library.Labels.DriveStatus then
-			Library.Labels.DriveStatus:SetText("Status: reversing (stuck recovery)")
+			Library.Labels.DriveStatus:SetText("Status: reversing (recovery)")
 		end
 		return
 	end
 
-	local avoidSteer, leftScore, rightScore = computeObstacleAvoidance(sensors)
+	local avoidSteer, leftTotal, rightTotal, bestAngle = computeObstacleAvoidance(sensors)
 	local desiredSteer = avoidSteer
 	local desiredSpeed = targetSpeed
 
 	if mode == "Saved Route Loop" and #LoadedRoutePoints >= 5 then
-		-- Pure-Pursuit along recorded loop
 		local n = #LoadedRoutePoints
-		-- Advance cursor if close to current point
 		local curPt = LoadedRoutePoints[RouteCursor]
 		local curDist = (Vector3.new(curPt.x, kin.pos.Y, curPt.z) - kin.pos).Magnitude
 		if curDist > 160 then
 			RouteCursor = findNearestRouteIndex(kin.pos, LoadedRoutePoints)
 		end
 
-		local lookaheadDist = math.clamp(22 + math.max(kin.forwardSpeed, 0) * 0.38, 22, 75)
+		local lookaheadDist = math.clamp(28 + math.max(kin.forwardSpeed, 0) * 0.55, 28, 110)
 		local targetIdx = RouteCursor
 		local walked = 0
-		for _ = 1, 30 do
+		for _ = 1, 40 do
 			local pA = LoadedRoutePoints[targetIdx]
 			local nextIdx = (targetIdx % n) + 1
 			local pB = LoadedRoutePoints[nextIdx]
@@ -767,9 +883,8 @@ local function stepAutoDrive(veh, kin, dt)
 				break
 			end
 		end
-		-- Advance RouteCursor when we pass near it
 		local dToCur = math.sqrt((curPt.x - kin.pos.X) ^ 2 + (curPt.z - kin.pos.Z) ^ 2)
-		if dToCur < 26 then
+		if dToCur < 28 then
 			RouteCursor = (RouteCursor % n) + 1
 		end
 
@@ -777,76 +892,96 @@ local function stepAutoDrive(veh, kin, dt)
 		local toAim = Vector3.new(aimPt.x - kin.pos.X, 0, aimPt.z - kin.pos.Z)
 		if toAim.Magnitude > 1 then
 			toAim = toAim.Unit
-			local cross = kin.forward.X * toAim.Z - kin.forward.Z * toAim.X
-			local dot = math.clamp(kin.forward:Dot(toAim), -1, 1)
-			local angleErr = math.atan2(cross, dot) -- positive = target is to the right
-			local routeSteer = math.clamp(angleErr * 1.35, -1, 1)
+			local cross = kin.flatForward.X * toAim.Z - kin.flatForward.Z * toAim.X
+			local dot = math.clamp(kin.flatForward:Dot(toAim), -1, 1)
+			local angleErr = math.atan2(cross, dot)
+			local routeSteer = math.clamp(angleErr * 1.45, -1, 1)
 
-			-- Blend with obstacle avoidance when something is close
+			local stopDist = computeStoppingDistance(kin.forwardSpeed)
 			local obstacleWeight = 0
-			if sensors.minForwardDist < 38 or sensors.leftCliff or sensors.rightCliff then
-				obstacleWeight = math.clamp((38 - sensors.minForwardDist) / 28, 0.25, 0.85)
+			if sensors.minForwardDist < stopDist * 1.2 or sensors.leftCliff or sensors.rightCliff then
+				obstacleWeight = math.clamp(1.0 - (sensors.minForwardDist / math.max(stopDist * 1.2, 20)), 0.3, 0.9)
 			end
 			desiredSteer = routeSteer * (1 - obstacleWeight) + avoidSteer * obstacleWeight
 
-			-- Slow for sharp route turns
-			if math.abs(angleErr) > 0.45 then
-				desiredSpeed = math.min(desiredSpeed, targetSpeed * 0.6)
+			if math.abs(angleErr) > 0.35 then
+				desiredSpeed = math.min(desiredSpeed, targetSpeed * math.clamp(1 - math.abs(angleErr) * 0.55, 0.38, 0.85))
 			end
 		end
 	end
 
-	-- Apply steering sensitivity and smoothing
+	-- Apply steering sensitivity and fast smoothing
 	desiredSteer = math.clamp(desiredSteer * steerSens, -1, 1)
-	SmoothedSteer = SmoothedSteer + (desiredSteer - SmoothedSteer) * math.min(dt * 9, 1)
+	SmoothedSteer = SmoothedSteer + (desiredSteer - SmoothedSteer) * math.min(dt * 12, 1)
 
-	-- Speed modulation for corners & obstacles
-	local turnSlowdown = 1 - math.abs(SmoothedSteer) * 0.42
-	desiredSpeed = desiredSpeed * math.clamp(turnSlowdown, 0.45, 1)
-
-	if sensors.minForwardDist < 22 then
-		desiredSpeed = 0
-	elseif sensors.minForwardDist < 48 then
-		local f = (sensors.minForwardDist - 22) / 26
-		desiredSpeed = math.min(desiredSpeed, targetSpeed * math.max(f, 0.25))
-	end
-
-	if sensors.hitOtherCarAhead and sensors.minForwardDist < 40 then
-		desiredSpeed = math.min(desiredSpeed, 20)
-	end
-
-	-- Compute throttle / brake
+	-- Physics-based braking & corner speed control
 	local speed = kin.forwardSpeed
-	local throttle, brake = 0, 0
-	if speed < desiredSpeed - 4 then
-		throttle = math.clamp((desiredSpeed - speed) / 25, 0.25, 1)
-	elseif speed > desiredSpeed + 10 then
-		brake = math.clamp((speed - desiredSpeed) / 35, 0.2, 1)
-	elseif desiredSpeed == 0 and speed > 2 then
-		brake = 1
+	local stopDist = computeStoppingDistance(speed)
+	local fwdDist = sensors.minForwardDist
+
+	-- Slow down before & during sharp bends
+	local turnRatio = math.max(math.abs(SmoothedSteer), math.abs(bestAngle) / 75)
+	if turnRatio > 0.25 then
+		local cornerCap = math.max(32, targetSpeed * (1.0 - turnRatio * 0.62))
+		desiredSpeed = math.min(desiredSpeed, cornerCap)
 	end
 
-	-- Stuck detection
-	if stuckEnabled and throttle > 0.2 and math.abs(kin.totalSpeed) < 4 then
-		StuckTimer = StuckTimer + dt
-		if StuckTimer >= 2.0 then
-			StuckTimer = 0
-			ReverseUntil = now + 1.6
-			ReverseSteerDir = (leftScore >= rightScore) and 1 or -1
-			return
+	-- Brake proactively based on actual stopping distance
+	local throttle, brake = 0, 0
+	if fwdDist < 16 then
+		-- Emergency stop / reverse-out trigger
+		desiredSpeed = 0
+		brake = 1.0
+	elseif fwdDist < stopDist * 0.95 then
+		-- Inside braking zone: full braking
+		desiredSpeed = 0
+		brake = 1.0
+	elseif fwdDist < stopDist * 1.55 then
+		-- Approaching corner/wall: proportional decel
+		local f = (fwdDist - stopDist * 0.95) / math.max(stopDist * 0.60, 10)
+		desiredSpeed = math.min(desiredSpeed, math.max(25, targetSpeed * f))
+	end
+
+	if sensors.hitOtherCarAhead and fwdDist < stopDist * 1.4 then
+		desiredSpeed = math.min(desiredSpeed, 15)
+	end
+
+	-- Throttle / Brake PID-like control
+	if brake == 0 then
+		if speed < desiredSpeed - 3 then
+			throttle = math.clamp((desiredSpeed - speed) / 22, 0.30, 1.0)
+		elseif speed > desiredSpeed + 6 then
+			brake = math.clamp((speed - desiredSpeed) / 28, 0.35, 1.0)
 		end
-	else
-		StuckTimer = math.max(0, StuckTimer - dt * 2)
+	end
+
+	-- Fast stuck / wall-wedge recovery
+	if stuckEnabled then
+		local wedgedClose = (fwdDist < 14 and speed < 10)
+		local stalled = (throttle > 0.2 and math.abs(kin.totalSpeed) < 4)
+		if wedgedClose or stalled then
+			StuckTimer = StuckTimer + dt * (wedgedClose and 2.5 or 1.0)
+			if StuckTimer >= 1.6 then
+				StuckTimer = 0
+				ReverseUntil = now + 1.75
+				-- Counter-steer away from the more blocked side while reversing
+				ReverseSteerDir = (leftTotal >= rightTotal) and 1 or -1
+				return
+			end
+		else
+			StuckTimer = math.max(0, StuckTimer - dt * 2.5)
+		end
 	end
 
 	applyDrivingInputs(throttle, brake, SmoothedSteer, dt)
 
 	if Library.Labels.DriveStatus then
 		Library.Labels.DriveStatus:SetText(string.format(
-			"Status: %s | %.0f/%.0f st/s | Steer %.2f",
+			"Status: %s | %.0f/%.0f st/s | Ahead %.0fst | Steer %.2f",
 			mode == "Saved Route Loop" and ("Loop: " .. LoadedRouteName) or "Free-Roam",
 			speed,
 			desiredSpeed,
+			fwdDist,
 			SmoothedSteer
 		))
 	end
@@ -854,13 +989,12 @@ end
 
 local function stepCollisionPrevention(veh, kin, dt)
 	local minSpeed = Options.ColMinSpeed and Options.ColMinSpeed.Value or 25
-	local ttcThreshold = Options.ColTTC and Options.ColTTC.Value or 0.9
+	local ttcThreshold = Options.ColTTC and Options.ColTTC.Value or 1.1
 	local colMode = Options.ColMode and Options.ColMode.Value or "Both (Brake + Steer)"
 
 	local sensors = scanSensors(veh, kin, 1.0)
 	local speed = kin.forwardSpeed
 	if speed < minSpeed then
-		-- Release only keys we might have been holding
 		releaseAllDrivingKeys()
 		if Library.Labels.AssistStatus then
 			Library.Labels.AssistStatus:SetText("Assist: standby (below min speed)")
@@ -868,23 +1002,27 @@ local function stepCollisionPrevention(veh, kin, dt)
 		return false
 	end
 
-	local ttc = sensors.minForwardDist / math.max(speed, 1)
-	local closeSideHazard = sensors.leftCliff or sensors.rightCliff or sensors.rays[2].dist < 10 or sensors.rays[6].dist < 10
+	local stopDist = computeStoppingDistance(speed)
+	local fwdDist = sensors.minForwardDist
+	local ttc = fwdDist / math.max(speed, 1)
+	local closeSideHazard = sensors.leftCliff or sensors.rightCliff
+		or sensors.rays[2].dist < 11 or sensors.rays[10].dist < 11
 
-	if ttc <= ttcThreshold or closeSideHazard then
+	local dangerAhead = (ttc <= ttcThreshold) or (fwdDist <= stopDist * 0.95)
+	if dangerAhead or closeSideHazard then
 		local avoidSteer = computeObstacleAvoidance(sensors)
-		local doBrake = (colMode == "Brake Only" or colMode == "Both (Brake + Steer)") and (ttc <= ttcThreshold)
+		local doBrake = (colMode == "Brake Only" or colMode == "Both (Brake + Steer)") and dangerAhead
 		local doSteer = (colMode == "Steer Only" or colMode == "Both (Brake + Steer)")
 
-		local brakeAmt = doBrake and math.clamp(1.2 - (ttc / math.max(ttcThreshold, 0.1)), 0.45, 1) or 0
+		local brakeAmt = doBrake and 1.0 or 0
 		local steerAmt = doSteer and avoidSteer or 0
 
 		applyDrivingInputs(0, brakeAmt, steerAmt, dt)
 		if Library.Labels.AssistStatus then
 			Library.Labels.AssistStatus:SetText(string.format(
-				"Assist: INTERVENING! TTC=%.2fs (%.0f st)",
+				"Assist: INTERVENING! TTC=%.2fs | Ahead %.0fst",
 				ttc,
-				sensors.minForwardDist
+				fwdDist
 			))
 		end
 		return true
@@ -892,7 +1030,7 @@ local function stepCollisionPrevention(veh, kin, dt)
 
 	releaseAllDrivingKeys()
 	if Library.Labels.AssistStatus then
-		Library.Labels.AssistStatus:SetText(string.format("Assist: clear (ahead %.0f st)", sensors.minForwardDist))
+		Library.Labels.AssistStatus:SetText(string.format("Assist: clear (ahead %.0f st)", fwdDist))
 	end
 	return false
 end
@@ -2051,6 +2189,6 @@ end)
 
 Library:Notify({
 	Title = "Allain Automation",
-	Description = "Midnight Racing: Tokyo v0.2 loaded! Press RightShift to toggle menu.",
+	Description = "Midnight Racing: Tokyo v0.3 loaded! Press RightShift to toggle menu.",
 	Time = 4,
 })
